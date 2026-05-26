@@ -1,0 +1,32 @@
+[package]
+name = "clark-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Typed agent loop with typed messages, typed events, swappable LLM transport, and plugin hooks. Provider-agnostic, sandbox-agnostic, tooling-agnostic."
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/clark-labs-inc/clark-agent"
+homepage = "https://github.com/clark-labs-inc/clark-agent"
+documentation = "https://docs.rs/clark-agent"
+keywords = ["agent", "llm", "tools", "runtime", "async"]
+categories = ["asynchronous"]
+
+[lib]
+name = "clark_agent"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+futures = "0.3"
+schemars = { version = "0.8", features = ["derive", "preserve_order"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "1"
+tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
