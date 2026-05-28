@@ -868,7 +868,7 @@ async fn stream_assistant_response(
         temperature: config.temperature,
         max_output_tokens,
         reasoning,
-        provider_extras: serde_json::Value::Null,
+        provider_extras: config.provider_extras.clone().unwrap_or(serde_json::Value::Null),
         // `tool_choice: "required"` on every turn. The LLM-in-charge
         // contract is "context → LLM → tool call → append result →
         // repeat" — the model's job is to pick a tool, not emit

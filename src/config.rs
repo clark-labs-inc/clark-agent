@@ -12,6 +12,8 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use serde_json::Value;
+
 use crate::event::{EventSink, NoopSink};
 use crate::plugin::{
     AfterToolCall, BeforeToolCall, ContextTransform, EventObserver, FollowUpSource, Plugin,
@@ -83,6 +85,13 @@ pub struct LoopConfig {
     /// per-request default and `provider_extras` no longer carries
     /// `reasoning_effort`. Default is [`ReasoningEffort::Minimal`].
     pub reasoning: ReasoningEffort,
+
+    /// Provider-specific extras forwarded to the stream transport on
+    /// every turn (e.g., `response_format` for structured output
+    /// enforcement, custom routing pins). Passed as-is into
+    /// [`crate::StreamRequest::provider_extras`]; `None` sends
+    /// `Value::Null`.
+    pub provider_extras: Option<Value>,
 
     /// Recovery strategy for `StopReason::MaxTokens` truncations. When
     /// `Some`, the loop discards a truncated assistant turn and
@@ -262,6 +271,7 @@ pub struct AgentBuilder {
     temperature: Option<f32>,
     max_output_tokens: Option<u32>,
     reasoning: ReasoningEffort,
+    provider_extras: Option<Value>,
     max_output_tokens_recovery: Option<MaxTokensRecovery>,
     max_iterations: Option<usize>,
     empty_outcome_retry_budget: Option<usize>,
@@ -294,6 +304,7 @@ impl AgentBuilder {
             temperature: None,
             max_output_tokens: None,
             reasoning: ReasoningEffort::default(),
+            provider_extras: None,
             max_output_tokens_recovery: None,
             max_iterations: None,
             empty_outcome_retry_budget: None,
@@ -357,6 +368,14 @@ impl AgentBuilder {
     /// flow through this typed surface.
     pub fn reasoning(mut self, level: ReasoningEffort) -> Self {
         self.reasoning = level;
+        self
+    }
+
+    /// Set provider-specific extras forwarded to the stream transport
+    /// on every turn (e.g., `response_format` for structured output
+    /// enforcement).
+    pub fn provider_extras(mut self, extras: Value) -> Self {
+        self.provider_extras = Some(extras);
         self
     }
 
@@ -654,6 +673,7 @@ impl AgentBuilder {
             temperature: self.temperature,
             max_output_tokens: self.max_output_tokens,
             reasoning: self.reasoning,
+            provider_extras: self.provider_extras,
             max_output_tokens_recovery: self.max_output_tokens_recovery,
             max_iterations: self.max_iterations,
             empty_outcome_retry_budget: self.empty_outcome_retry_budget,
