@@ -63,10 +63,7 @@ impl AgentTool for EchoTool {
         _signal: CancellationToken,
         _update: ToolUpdateSink,
     ) -> Result<ToolResult, clark_agent::ToolError> {
-        let text = args
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
         Ok(ToolResult::text(format!("echo: {text}")))
     }
 }

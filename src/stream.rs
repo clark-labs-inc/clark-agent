@@ -196,7 +196,7 @@ pub enum StreamErrorKind {
     ProviderRateLimited,
     /// Transport failed before the provider produced any actionable
     /// assistant turn. Hidden reasoning/details, usage, or an unusable
-    /// burst of partial tool-call deltas may have arrived, but Clark
+    /// burst of partial tool-call deltas may have arrived, but the loop
     /// still has no runnable next step, so this is safer to replay than
     /// a generic transient stream error.
     ZeroOutputTransport,

@@ -349,11 +349,12 @@ pub trait AgentTool: Send + Sync + 'static {
     ///
     /// Lightweight status-only tools (progress notes, hidden journals)
     /// override to `false`. The runtime then ignores their vote
-    /// entirely — they are neither a "yes" nor a "no" — so a model
-    /// that emits `[message_result, message_info]` in the same batch
-    /// can still terminate. An all-advisory batch (no tool with this
-    /// flag set to `true` voted yes) does NOT terminate, preserving
-    /// the contract that progress notes never end a run on their own.
+    /// entirely — they are neither a "yes" nor a "no" — so a model that
+    /// emits a terminating delivery call alongside an advisory status
+    /// call in the same batch can still terminate. An all-advisory batch
+    /// (no tool with this flag set to `true` voted yes) does NOT
+    /// terminate, preserving the contract that progress notes never end
+    /// a run on their own.
     fn counts_toward_termination_vote(&self) -> bool {
         true
     }
@@ -393,10 +394,11 @@ pub trait AgentTool: Send + Sync + 'static {
 // no opportunity for drift. New tool authors implement `TypedAgentTool` and
 // get the `AgentTool` impl for free via the blanket below.
 //
-// Tag-dispatched tools (e.g. `plan(action="set"|"update"|"advance")`,
-// `publish(target="website"|"artifact")`) use a `#[serde(tag = "...")]`
-// enum as `Args`; serde routes the discriminator natively, so the
-// "unknown field `action`" failure mode that motivated this trait can
+// Tag-dispatched tools (a single tool with several modes selected by a
+// discriminator field, e.g. `edit(op="insert"|"replace"|"delete")`) use a
+// `#[serde(tag = "...")]` enum as `Args`; serde routes the discriminator
+// natively, so the "unknown field `op`" failure mode that motivated this
+// trait can
 // no longer happen.
 // ---------------------------------------------------------------------------
 
@@ -559,14 +561,13 @@ impl<T: TypedAgentTool> AgentTool for T {
         update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         // Strip top-level `null` fields before deserializing.
-        // Tagged-enum tools (shell, plan, ...) have variants with
-        // `deny_unknown_fields`, but `flatten_tagged_oneof_schema`
-        // exposes EVERY variant's fields as a union. Models like
-        // gemini-3-flash-preview populate non-applicable fields with
-        // `null` ("being helpful" — submit all schema-known fields).
-        // Without this strip, the chosen variant rejects with
-        // `unknown field` and a turn is wasted (matrix run
-        // 20260502_111307: every gemini scenario hit this on shell).
+        // Tagged-enum tools have variants with `deny_unknown_fields`,
+        // but `flatten_tagged_oneof_schema` exposes EVERY variant's
+        // fields as a union. Some models populate non-applicable fields
+        // with `null` ("being helpful" — submitting all schema-known
+        // fields). Without this strip, the chosen variant rejects with
+        // `unknown field` and a turn is wasted — observed across whole
+        // eval suites for some providers on tagged-enum tools.
         // Nulls carry no semantic value at this boundary — they are
         // either "field not set" or "inapplicable to the chosen
         // variant"; both collapse to "drop the field and let the
@@ -579,8 +580,8 @@ impl<T: TypedAgentTool> AgentTool for T {
         let prepared = AgentTool::prepare_arguments(self, args);
         let stripped = strip_top_level_nulls(prepared);
         // Coerce string-encoded scalars (integers, numbers, booleans)
-        // to their declared types BEFORE serde validation runs. Models
-        // in the auto-when-forced class (Qwen 3.5 Flash today) emit
+        // to their declared types BEFORE serde validation runs. Some
+        // providers (notably the "auto-when-forced" class) emit
         // tool-call arguments where every value is a JSON string —
         // `{"max_iterations": "50"}` instead of `{"max_iterations": 50}`.
         // The strict serde path rejects every such call, wasting a turn
@@ -1081,7 +1082,9 @@ impl ToolRegistry {
     /// `SemanticLoopDetector` (and any future plugin that needs the
     /// same identity contract) takes one of these at construction so
     /// it does not have to hold an `Arc<ToolRegistry>`.
-    pub fn identity_policies(&self) -> std::collections::HashMap<String, crate::tool_identity::ToolIdentityPolicy> {
+    pub fn identity_policies(
+        &self,
+    ) -> std::collections::HashMap<String, crate::tool_identity::ToolIdentityPolicy> {
         self.tools
             .iter()
             .map(|(name, tool)| (name.clone(), tool.identity_policy()))
@@ -1352,10 +1355,9 @@ mod tests {
 
     #[test]
     fn strip_top_level_nulls_removes_inapplicable_variant_fields() {
-        // Regression: matrix run 20260502_111307 surfaced weaker
-        // models submitting EVERY field from EVERY tagged-enum
-        // variant, with `null` for the non-applicable ones,
-        // alongside the chosen discriminator. The chosen variant
+        // Regression: weaker models submit EVERY field from EVERY
+        // tagged-enum variant, with `null` for the non-applicable
+        // ones, alongside the chosen discriminator. The chosen variant
         // has `deny_unknown_fields` and rejected with unknown
         // sibling fields. Stripping top-level nulls before
         // deserializing collapses these to missing fields and lets
@@ -1408,14 +1410,13 @@ mod tests {
 
     // ---- string-encoded-scalar coercion -------------------------------
     //
-    // qwen 3.5 Flash (and other auto-when-forced providers) emit tool
+    // Some providers (notably the "auto-when-forced" class) emit tool
     // arguments as JSON strings for fields the schema declares as
-    // integers, booleans, or numbers. The 20260517 external-agent-parity
-    // run showed `max_iterations: "50"`, `num_results: "10"`,
-    // `full_page: "True"`, `full_page: "true"` — each a wasted turn
-    // under strict serde. The coercion helpers normalize the dominant
-    // cases against the tool's own JSON Schema; ambiguous cases are
-    // left to the strict path.
+    // integers, booleans, or numbers — e.g. `max_iterations: "50"`,
+    // `num_results: "10"`, `full_page: "True"`, `full_page: "true"` —
+    // each a wasted turn under strict serde. The coercion helpers
+    // normalize the dominant cases against the tool's own JSON Schema;
+    // ambiguous cases are left to the strict path.
 
     fn make_schema(properties: Value) -> Value {
         serde_json::json!({
@@ -1479,10 +1480,8 @@ mod tests {
         let schema = make_schema(serde_json::json!({
             "temperature": {"type": "number"},
         }));
-        let coerced = coerce_string_scalars_at_top_level(
-            serde_json::json!({"temperature": "0.7"}),
-            &schema,
-        );
+        let coerced =
+            coerce_string_scalars_at_top_level(serde_json::json!({"temperature": "0.7"}), &schema);
         // f64 → Number round-trips through serde_json::Number::from_f64.
         let n = coerced["temperature"].as_f64().expect("number");
         assert!((n - 0.7).abs() < 1e-9);
@@ -1542,10 +1541,8 @@ mod tests {
         let schema = make_schema(serde_json::json!({
             "value": {"type": ["integer", "string"]},
         }));
-        let coerced = coerce_string_scalars_at_top_level(
-            serde_json::json!({"value": "42"}),
-            &schema,
-        );
+        let coerced =
+            coerce_string_scalars_at_top_level(serde_json::json!({"value": "42"}), &schema);
         assert_eq!(coerced, serde_json::json!({"value": "42"}));
     }
 
@@ -1555,10 +1552,7 @@ mod tests {
         // that ship a schema without explicit `properties` (e.g. when
         // the args type is `serde_json::Value`).
         let schema = serde_json::json!({"type": "object"});
-        let coerced = coerce_string_scalars_at_top_level(
-            serde_json::json!({"x": "50"}),
-            &schema,
-        );
+        let coerced = coerce_string_scalars_at_top_level(serde_json::json!({"x": "50"}), &schema);
         assert_eq!(coerced, serde_json::json!({"x": "50"}));
     }
 
@@ -1613,13 +1607,8 @@ mod tests {
 
     #[test]
     fn enrich_appends_sequence_hint_for_string_in_array_slot() {
-        let xml_soup =
-            "\n<ref>{\"kind\":\"file\",\"path\":\"x.md\"}</ref></artifact></file_write>";
-        let msg = hint_for(
-            serde_json::json!({"items": xml_soup}),
-            "sequence",
-        )
-        .unwrap();
+        let xml_soup = "\n<ref>{\"kind\":\"file\",\"path\":\"x.md\"}</ref></artifact></file_write>";
+        let msg = hint_for(serde_json::json!({"items": xml_soup}), "sequence").unwrap();
         assert!(
             msg.contains("Expected a JSON array"),
             "expected sequence hint, got: {msg}"
@@ -1775,7 +1764,7 @@ mod tests {
     // (1) strip_top_level_nulls, (2) coerce_string_scalars_at_top_level,
     // (3) serde_json::from_value, (4) enrich_arg_parse_error_message.
     // Exercise the full path with a tool whose args mix the scalar types
-    // qwen 3.5 Flash routinely encodes as strings.
+    // some providers routinely encode as strings.
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
@@ -1814,10 +1803,10 @@ mod tests {
 
     #[tokio::test]
     async fn execute_coerces_string_encoded_scalars_end_to_end() {
-        // The four shapes qwen emits in practice — strings where the
-        // schema declares integers, booleans, or floats. Each must pass
-        // the validator after coercion and reach the tool's `run` with
-        // the typed value.
+        // The four shapes seen in practice — strings where the schema
+        // declares integers, booleans, or floats. Each must pass the
+        // validator after coercion and reach the tool's `run` with the
+        // typed value.
         let tool = CoercibleTool;
         let (tx, _rx) = mpsc::unbounded_channel();
         let result = AgentTool::execute(
@@ -1969,7 +1958,10 @@ mod tests {
         let ToolResultBlock::Text(t) = &result.content[0] else {
             panic!("expected text result");
         };
-        assert!(!result.is_error, "execute must succeed after action inference");
+        assert!(
+            !result.is_error,
+            "execute must succeed after action inference"
+        );
         assert_eq!(t.text, "open:https://example.com");
     }
 

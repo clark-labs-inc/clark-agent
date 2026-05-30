@@ -316,10 +316,9 @@ pub trait ContextTransform: Plugin {
     /// When `false`, the loop skips the full message-vec clone + the
     /// `ContextTransformApplied` diff event — eliminating the
     /// per-transform cost on rounds where the plugin is a no-op. This
-    /// shows up most clearly in long-running scenarios: the
-    /// `artifact-quality-multiple-websites-and-decks` matrix run had six
-    /// transforms firing 201 times each as no-ops, with the full
-    /// before-clone + event emit happening every time.
+    /// shows up most clearly in long-running scenarios: with several
+    /// transforms installed, each firing hundreds of times as a no-op,
+    /// the full before-clone + event emit otherwise happens every time.
     ///
     /// Predicates MUST be O(1) or O(small-constant); a predicate that
     /// itself walks the entire history defeats the optimization.
@@ -393,7 +392,7 @@ pub struct ToolGateContext<'a> {
     /// signals like "have we seen a terminator yet" or "how many tool
     /// results in a row didn't make progress".
     pub messages: &'a [AgentMessage],
-    /// Conversation identifier when the host runtime knows one (Clark's
+    /// Conversation identifier when the host runtime knows one (a
     /// session runner threads it through). `None` for embeddings of the
     /// loop that don't carry conversation identity (tests, isolated
     /// subagent runs). Gates can use this for diagnostics or

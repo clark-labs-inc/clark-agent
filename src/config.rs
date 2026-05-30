@@ -20,14 +20,14 @@ use crate::plugin::{
     SteeringSource, ToolGate,
 };
 use crate::plugins::graceful_turn_limit::GracefulTurnLimit;
+use crate::protocol::{default_policy, ProtocolPolicy};
 use crate::stream::{ReasoningEffort, StreamFn};
 use crate::tokens::{CharHeuristicEstimator, TokenEstimator};
 use crate::tool::{ExecutionMode, ToolRegistry};
 
 /// Default number of grace iterations the soft-limit warning leaves before
-/// the hard `max_iterations` cap. Picked to match pi-subagents' default and
-/// to give a wrap-up turn plus a couple of recovery turns when the model
-/// needs them.
+/// the hard `max_iterations` cap. Sized to give a wrap-up turn plus a
+/// couple of recovery turns when the model needs them.
 pub const DEFAULT_GRACE_ITERATIONS: usize = 5;
 
 /// Assembled loop configuration. Construct via [`AgentBuilder`].
@@ -38,6 +38,15 @@ pub struct LoopConfig {
     pub stream: Arc<dyn StreamFn>,
     pub tools: Arc<ToolRegistry>,
     pub event_sink: Arc<dyn EventSink>,
+
+    /// Conversation-protocol policy: the seam that supplies any
+    /// product-specific tool vocabulary (plain-text recovery prose,
+    /// tool-call alias repair, hidden-tool errors, terminal-tool
+    /// classification). Defaults to [`crate::DefaultProtocolPolicy`],
+    /// whose behavior is generic and names no specific tools. Downstream
+    /// product crates install their own via
+    /// [`AgentBuilder::protocol_policy`]. See [`crate::protocol`].
+    pub protocol: Arc<dyn ProtocolPolicy>,
 
     /// Optional conversation identifier, surfaced to plugins via
     /// `ToolGateContext::conversation_id`. The agent core itself does
@@ -81,9 +90,9 @@ pub struct LoopConfig {
     pub max_output_tokens: Option<u32>,
 
     /// Reasoning-effort knob forwarded to the stream transport on every
-    /// turn. Single source of truth: the bridge no longer hardcodes a
-    /// per-request default and `provider_extras` no longer carries
-    /// `reasoning_effort`. Default is [`ReasoningEffort::Minimal`].
+    /// turn. The single source of truth for per-request reasoning effort:
+    /// the transport reads it here rather than from per-provider extras.
+    /// Default is [`ReasoningEffort::Minimal`].
     pub reasoning: ReasoningEffort,
 
     /// Provider-specific extras forwarded to the stream transport on
@@ -122,12 +131,11 @@ pub struct LoopConfig {
     /// When true, [`Self::plain_text_terminal_fallback_tool`] fires on the
     /// FIRST plain-text stop instead of waiting for the turn allowlist to
     /// narrow to terminators. Intended for providers in the
-    /// auto-when-forced class (e.g. Qwen 3.5 Flash) where wire-level
-    /// `tool_choice: "required"` is rejected and so plain text is the
-    /// model's default failure mode — there's no benefit to running the
-    /// `TerminalMessageGuard` nudge cycle first because the model will
-    /// emit prose every time. Default `false` preserves the post-narrowing
-    /// gate for everyone else.
+    /// "auto-when-forced" class where wire-level `tool_choice: "required"`
+    /// is rejected and so plain text is the model's default failure mode —
+    /// there's no benefit to running the narrowing-gate nudge cycle first
+    /// because the model will emit prose every time. Default `false`
+    /// preserves the post-narrowing gate for everyone else.
     pub plain_text_terminal_fallback_eager: bool,
 
     /// When true, the eager plain-text fallback path nudges the model with
@@ -284,6 +292,7 @@ pub struct AgentBuilder {
     conversation_id: Option<String>,
     model_id: Option<String>,
     token_estimator: Arc<dyn TokenEstimator>,
+    protocol: Arc<dyn ProtocolPolicy>,
     plugins: PluginRegistry,
 }
 
@@ -317,6 +326,7 @@ impl AgentBuilder {
             conversation_id: None,
             model_id: None,
             token_estimator: Arc::new(CharHeuristicEstimator),
+            protocol: default_policy(),
             plugins: PluginRegistry::default(),
         }
     }
@@ -363,9 +373,8 @@ impl AgentBuilder {
     }
 
     /// Set the reasoning-effort knob forwarded to the stream transport
-    /// on every turn. Replaces the legacy stringly-typed
-    /// `provider_config["reasoning_effort"]` knob; per-job overrides
-    /// flow through this typed surface.
+    /// on every turn. Per-run overrides flow through this typed surface
+    /// rather than through stringly-typed provider extras.
     pub fn reasoning(mut self, level: ReasoningEffort) -> Self {
         self.reasoning = level;
         self
@@ -406,7 +415,7 @@ impl AgentBuilder {
     /// Convert plain assistant text into a terminal tool result on
     /// terminal-only compatibility turns. Intended for providers that reject
     /// `tool_choice: "required"` and therefore can leak final prose even
-    /// while Clark advertises only delivery tools.
+    /// while the host advertises only delivery tools.
     pub fn plain_text_terminal_fallback_tool(mut self, tool_name: impl Into<String>) -> Self {
         self.plain_text_terminal_fallback_tool = Some(tool_name.into());
         self
@@ -414,11 +423,10 @@ impl AgentBuilder {
 
     /// Make [`Self::plain_text_terminal_fallback_tool`] fire on the FIRST
     /// plain-text stop instead of waiting for the turn allowlist to be
-    /// narrowed to terminators by `TerminalMessageGuard`. Use this for
-    /// providers in the auto-when-forced class (Qwen 3.5 Flash today)
-    /// where wire-level forcing isn't available, so prose is the
-    /// model's default failure mode and the nudge cycle just burns
-    /// turns. Has no effect unless
+    /// narrowed to terminators by a downstream tool gate. Use this for
+    /// providers in the "auto-when-forced" class where wire-level forcing
+    /// isn't available, so prose is the model's default failure mode and
+    /// the nudge cycle just burns turns. Has no effect unless
     /// [`Self::plain_text_terminal_fallback_tool`] is also set.
     pub fn plain_text_terminal_fallback_eager(mut self, eager: bool) -> Self {
         self.plain_text_terminal_fallback_eager = eager;
@@ -506,6 +514,17 @@ impl AgentBuilder {
     /// Variant for callers that already share an estimator by `Arc`.
     pub fn token_estimator_arc(mut self, est: Arc<dyn TokenEstimator>) -> Self {
         self.token_estimator = est;
+        self
+    }
+
+    /// Install a [`ProtocolPolicy`] — the seam through which a downstream
+    /// product supplies its tool vocabulary (plain-text recovery prose,
+    /// tool-call alias repair, hidden-tool errors, terminal-tool
+    /// classification). Defaults to [`crate::DefaultProtocolPolicy`] when
+    /// not set, which keeps the core free of any product tool names. See
+    /// [`crate::protocol`].
+    pub fn protocol_policy(mut self, policy: Arc<dyn ProtocolPolicy>) -> Self {
+        self.protocol = policy;
         self
     }
 
@@ -679,12 +698,12 @@ impl AgentBuilder {
             empty_outcome_retry_budget: self.empty_outcome_retry_budget,
             plain_text_terminal_fallback_tool: self.plain_text_terminal_fallback_tool,
             plain_text_terminal_fallback_eager: self.plain_text_terminal_fallback_eager,
-            plain_text_terminal_fallback_eager_nudge: self
-                .plain_text_terminal_fallback_eager_nudge,
+            plain_text_terminal_fallback_eager_nudge: self.plain_text_terminal_fallback_eager_nudge,
             grace_iterations: self.grace_iterations,
             conversation_id: self.conversation_id,
             model_id: self.model_id,
             token_estimator: self.token_estimator,
+            protocol: self.protocol,
             grace_signal,
             plugins: self.plugins,
         })
@@ -725,14 +744,15 @@ impl LoopConfig {
     /// - max-output-tokens recovery ladder
     /// - default execution mode, `max_tool_calls_per_turn`
     /// - model id, grace iterations
+    /// - protocol policy ([`ProtocolPolicy`])
     /// - plain-text-terminal fallback knobs
     /// - every plugin whose
     ///   [`crate::plugin::PluginCapabilities::inheritable_to_child`]
     ///   bit is set
     ///
     /// Does **not** inherit:
-    /// - `event_sink` — callers install a child-scoped sink (typically
-    ///   `ChildRunSink` in the bridge) before `build`.
+    /// - `event_sink` — callers install a child-scoped sink before
+    ///   `build`.
     /// - `max_iterations` — children get their own budget; defaults
     ///   to unbounded until the caller sets one.
     /// - `empty_outcome_retry_budget` — child runs make independent
@@ -742,11 +762,10 @@ impl LoopConfig {
     /// - plugins that did **not** opt in to inheritance — they remain
     ///   parent-only.
     ///
-    /// This is the single primitive for "spawn a fresh Clark with the
-    /// same execution shape as me." Replaces the bridge's hand-rolled
-    /// re-assembly in `InProcessRunner::run`; bridges still register
-    /// child-specific guards (delivery gate, terminal guard, profile
-    /// guards, etc.) on top of the returned builder.
+    /// This is the single primitive for "spawn a fresh child agent with
+    /// the same execution shape as me." A host runtime still registers
+    /// any child-specific guards (delivery gates, terminal guards, etc.)
+    /// on top of the returned builder.
     pub fn child_builder(&self) -> AgentBuilder {
         let mut builder = AgentBuilder::new()
             .stream(self.stream.clone())
@@ -754,7 +773,8 @@ impl LoopConfig {
             .default_execution_mode(self.default_execution_mode)
             .reasoning(self.reasoning)
             .grace_iterations(self.grace_iterations)
-            .token_estimator_arc(self.token_estimator.clone());
+            .token_estimator_arc(self.token_estimator.clone())
+            .protocol_policy(self.protocol.clone());
         if let Some(t) = self.temperature {
             builder = builder.temperature(t);
         }
@@ -979,10 +999,7 @@ mod child_builder_tests {
             .build()
             .expect("parent builds");
 
-        let child = parent
-            .child_builder()
-            .build()
-            .expect("child builds");
+        let child = parent.child_builder().build().expect("child builds");
 
         let names = child.plugin_names();
         assert_eq!(

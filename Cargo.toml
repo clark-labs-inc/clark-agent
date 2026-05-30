@@ -1,9 +1,10 @@
 [package]
 name = "clark-agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.94"
-description = "Typed agent loop with typed messages, typed events, swappable LLM transport, and plugin hooks. Provider-agnostic, sandbox-agnostic, tooling-agnostic."
+authors = ["Stanislav Kirdey, Clark Labs Inc. <https://github.com/clark-labs-inc>"]
+description = "Typed agent loop with typed messages, typed events, swappable LLM transport, and plugin hooks. Provider-agnostic, sandbox-agnostic, tooling-agnostic. By Clark Labs Inc."
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/clark-labs-inc/clark-agent"

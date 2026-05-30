@@ -53,20 +53,6 @@ if the answer is ready, use the final response tool.";
 /// without leaning on a caller-configured `empty_outcome_retry_budget`.
 const MAX_PLAIN_TEXT_NUDGE_RETRIES: usize = 2;
 
-const PLAIN_TEXT_NUDGE_CONTEXT: &str = "\
-[runtime context — protocol recovery, not user instruction]\n\
-Your previous response was plain text with no tool call. The runtime cannot deliver, ask, or work on prose — every turn MUST select exactly one structured tool call.\n\
-\n\
-The user's intent is clear from their message. Do not ask \"Would you like me to proceed?\", \"Shall I continue?\", or \"Do you need credentials?\" — those questions are friction. Make the obvious decision and execute.\n\
-\n\
-Pick exactly one tool now and call it:\n\
-- `message_result` — final delivery (full answer text, or a partial result naming a concrete blocker).\n\
-- `message_ask` — ONLY for user-owned input the user did not provide (real credential, personal preference, destination for their data).\n\
-- `plan` — set phases for multi-step work (required on turn 1 for non-trivial tasks).\n\
-- Any other catalog tool when real work needs to happen first.\n\
-\n\
-Re-read the user's request and call a tool. Do not type a clarifying question.";
-
 /// Outcome label for a completed run.
 ///
 /// Distinguishes natural termination from budget-pressure terminations so
@@ -234,20 +220,18 @@ async fn inner_run(
         // Did the most recent tool batch vote terminate? Reset per
         // outer iteration so a follow-up-driven re-entry starts clean.
         //
-        // When the model produces a unanimous terminator (e.g.
-        // `message_result.terminate=true`), the run is over —
+        // When the batch produces a unanimous terminator (every
+        // finalized result votes `terminate = true`), the run is over —
         // `SteeringSource` and `FollowUpSource` plugins must NOT
         // re-prompt the model with another LLM call. Without this
         // guard a steering source whose firing condition lined up
         // with the same turn (e.g. `graceful_turn_limit` reaching
         // its soft limit on the same turn the model delivered)
         // would inject a wrap-up message and the loop would burn
-        // another turn after a clean delivery — observed on
-        // `working-checkpoint-store-and-recall` in matrix run
-        // 20260507_100311, where `gemini-3-flash-preview` drifted
-        // into hallucinated content on the wrap-up re-entry after
-        // the prior batch had already produced the correct
-        // `message_result`.
+        // another turn after a clean delivery — observed in production,
+        // where a model drifted into hallucinated content on the
+        // wrap-up re-entry after the prior batch had already produced
+        // the correct terminal delivery.
         let mut last_batch_terminated = false;
 
         while has_more_tool_calls || !pending.is_empty() {
@@ -370,8 +354,12 @@ async fn inner_run(
             if tool_calls.is_empty() {
                 if let Some(tool_name) = config.plain_text_terminal_fallback_tool.as_deref() {
                     let eager = config.plain_text_terminal_fallback_eager;
-                    let narrowed_to_terminators =
-                        is_terminal_only_allowlist(turn_allowlist.as_ref(), tool_name);
+                    let terminal_tool_names = config.protocol.terminal_tool_names();
+                    let narrowed_to_terminators = is_terminal_only_allowlist(
+                        turn_allowlist.as_ref(),
+                        tool_name,
+                        &terminal_tool_names,
+                    );
                     let preserve_plain_text_candidate = plain_assistant_text(&assistant)
                         .is_some_and(|text| should_preserve_plain_text_terminal_candidate(&text));
                     if plain_text_terminal_fallback_candidate.is_none()
@@ -399,8 +387,26 @@ async fn inner_run(
                         // overwritten by `collect_steering` at end-of-iter.
                         // Set `has_more_tool_calls = true` to satisfy the
                         // inner while-loop's continuation predicate.
+                        //
+                        // The recovery prose comes from the active
+                        // `ProtocolPolicy` (which may name the product's
+                        // delivery / ask tools); the core falls back to a
+                        // generic, vocabulary-free nudge.
+                        let available_tool_names: Vec<&str> =
+                            config.tools.iter().map(|t| t.name()).collect();
+                        let nudge_text = config
+                            .protocol
+                            .plain_text_recovery_prompt(crate::protocol::PlainTextRecoveryContext {
+                                messages: &current.messages,
+                                iteration: iterations - 1,
+                                available_tool_names: &available_tool_names,
+                                terminal_fallback_tool: Some(tool_name),
+                            })
+                            .unwrap_or_else(|| {
+                                crate::protocol::DEFAULT_PLAIN_TEXT_RECOVERY_PROMPT.to_string()
+                            });
                         let nudge = AgentMessage::System {
-                            content: PLAIN_TEXT_NUDGE_CONTEXT.to_string(),
+                            content: nudge_text,
                             timestamp: Some(now_ms()),
                         };
                         current.messages.push(nudge.clone());
@@ -413,6 +419,7 @@ async fn inner_run(
                         turn_allowlist.as_ref(),
                         tool_name,
                         eager,
+                        &terminal_tool_names,
                     ) {
                         plain_text_terminal_fallback_candidate = None;
                         last_turn_stopped_without_tool = false;
@@ -591,14 +598,15 @@ fn synthesize_plain_text_terminal_result(
     turn_allowlist: Option<&std::collections::HashSet<String>>,
     tool_name: &str,
     eager: bool,
+    terminal_tool_names: &std::collections::HashSet<String>,
 ) -> Option<AgentMessage> {
     // The default contract is "only convert plain text once the runtime
     // has narrowed the catalog to terminators" — preserves strict
     // delivery shape for everyone else. When `eager` is set the gate is
-    // lifted: the bridge has signalled this provider can never honor
+    // lifted: the host has signalled this provider can never honor
     // forced tool choice, so prose IS the failure mode and the nudge
     // cycle that normally narrows the allowlist would just burn turns.
-    if !eager && !is_terminal_only_allowlist(turn_allowlist, tool_name) {
+    if !eager && !is_terminal_only_allowlist(turn_allowlist, tool_name, terminal_tool_names) {
         return None;
     }
     let text = plain_assistant_text(assistant)?;
@@ -655,22 +663,27 @@ fn looks_like_permission_or_clarification_question(text: &str) -> bool {
             && (lower.contains("next") || lower.contains("continue")))
 }
 
+/// Whether a turn's allowlist has narrowed to "terminal only" — it
+/// contains the configured fallback terminal tool and nothing but
+/// terminal/delivery tools. The set of *other* names that count as
+/// terminal comes from the active [`crate::protocol::ProtocolPolicy`]
+/// ([`crate::protocol::ProtocolPolicy::terminal_tool_names`]); the core
+/// hardcodes no product tool names. With the default policy (empty extra
+/// set) an allowlist is terminal-only exactly when it contains only the
+/// fallback tool itself.
 fn is_terminal_only_allowlist(
     turn_allowlist: Option<&std::collections::HashSet<String>>,
     terminal_tool: &str,
+    terminal_tool_names: &std::collections::HashSet<String>,
 ) -> bool {
     let Some(allowlist) = turn_allowlist else {
         return false;
     };
     !allowlist.is_empty()
         && allowlist.contains(terminal_tool)
-        && allowlist.iter().all(|tool| {
-            tool == terminal_tool
-                || tool == "message_ask"
-                || tool == "message_info"
-                || tool == "message_result"
-                || tool == "terminator"
-        })
+        && allowlist
+            .iter()
+            .all(|tool| tool == terminal_tool || terminal_tool_names.contains(tool))
 }
 
 // ─── Stream one assistant response ─────────────────────────────────
@@ -868,15 +881,18 @@ async fn stream_assistant_response(
         temperature: config.temperature,
         max_output_tokens,
         reasoning,
-        provider_extras: config.provider_extras.clone().unwrap_or(serde_json::Value::Null),
+        provider_extras: config
+            .provider_extras
+            .clone()
+            .unwrap_or(serde_json::Value::Null),
         // `tool_choice: "required"` on every turn. The LLM-in-charge
         // contract is "context → LLM → tool call → append result →
         // repeat" — the model's job is to pick a tool, not emit
-        // narration. `message_result` IS the terminal text-delivery
-        // tool, so required-on-every-turn doesn't trap the model:
-        // when the work is done it calls `message_result` to deliver
-        // the answer. If the model loops on verification instead, the
-        // bug is in the catalog or prompt — not in the requirement.
+        // narration. This assumes the catalog includes a terminal
+        // text-delivery tool, so required-on-every-turn doesn't trap the
+        // model: when the work is done it calls that delivery tool to
+        // return the answer. If the model loops on verification instead,
+        // the bug is in the catalog or prompt — not in the requirement.
         force_tool_call: true,
     };
 
@@ -1285,6 +1301,26 @@ mod tests {
 
     struct TerminalOnlyGate;
     struct TerminalWithStatusGate;
+
+    /// A product protocol policy that declares several delivery/status
+    /// tools (beyond the configured fallback tool) as terminal, so an
+    /// allowlist narrowed to `{message_info, message_result}` still
+    /// classifies as terminal-only. The core ships none of these names;
+    /// they live behind the policy.
+    struct TestTerminalPolicy;
+    impl crate::protocol::ProtocolPolicy for TestTerminalPolicy {
+        fn terminal_tool_names(&self) -> std::collections::HashSet<String> {
+            [
+                "message_info",
+                "message_ask",
+                "message_result",
+                "terminator",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+        }
+    }
     struct StaticAllowGate {
         name: &'static str,
         tools: &'static [&'static str],
@@ -1570,7 +1606,7 @@ mod tests {
         assert_eq!(
             requests[1].reasoning,
             ReasoningEffort::Minimal,
-            "zero-output replay should lower high reasoning so Gemini-style private-only spins can produce a tool call"
+            "zero-output replay should lower high reasoning so reasoning-heavy private-only spins can produce a tool call"
         );
         assert!(
             requests[1].messages.iter().any(|message| matches!(
@@ -1635,8 +1671,8 @@ mod tests {
         }
     }
 
-    /// Tool that always votes `terminate=true`. Mirrors the contract
-    /// the bridge's `MessageResultTool` upholds.
+    /// Tool that always votes `terminate=true`. Mirrors the contract a
+    /// downstream terminal/delivery tool upholds.
     struct TerminatorTool;
 
     #[async_trait::async_trait]
@@ -1735,15 +1771,15 @@ mod tests {
 
     #[tokio::test]
     async fn terminator_vote_skips_post_batch_steering_collection() {
-        // Pattern C-3-a regression: a `SteeringSource` whose firing
-        // condition lines up with the same turn the model delivers
-        // (e.g. `graceful_turn_limit` reaching its soft limit on the
-        // delivery turn) used to re-enter the loop and prompt the
-        // model for ANOTHER turn after a clean terminator. The
-        // model's drift on that extra turn corrupted the user-visible
-        // answer in matrix run 20260507_100311. With the fix, a
-        // unanimous terminator vote is a hard exit — steering sources
-        // are not polled once the run has decided it's done.
+        // Regression: a `SteeringSource` whose firing condition lines
+        // up with the same turn the model delivers (e.g.
+        // `graceful_turn_limit` reaching its soft limit on the delivery
+        // turn) used to re-enter the loop and prompt the model for
+        // ANOTHER turn after a clean terminator. The model's drift on
+        // that extra turn corrupted the user-visible answer in
+        // production. With the fix, a unanimous terminator vote is a
+        // hard exit — steering sources are not polled once the run has
+        // decided it's done.
         let stream = Arc::new(TerminatorOnlyStream::default());
         let polls = Arc::new(AtomicUsize::new(0));
         let mut tool_registry = crate::tool::ToolRegistry::new();
@@ -2032,12 +2068,12 @@ mod tests {
 
     #[tokio::test]
     async fn eager_plain_text_fallback_fires_without_terminal_only_allowlist() {
-        // Models in the auto-when-forced class (Qwen 3.5 Flash etc.)
-        // can never be wire-forced into a tool call, so prose IS their
-        // failure mode. The eager flag lifts the
-        // "allowlist must already be narrowed" precondition so the
-        // fallback fires on the FIRST plain-text stop instead of after
-        // `TerminalMessageGuard` has burned 2-3 nudge turns.
+        // Providers in the "auto-when-forced" class can never be
+        // wire-forced into a tool call, so prose IS their failure mode.
+        // The eager flag lifts the "allowlist must already be narrowed"
+        // precondition so the fallback fires on the FIRST plain-text
+        // stop instead of after a narrowing gate has burned 2-3 nudge
+        // turns.
         //
         // No `tool_gate_arc` is installed in this test, so the catalog
         // stays at the full registry — exactly the situation where the
@@ -2121,7 +2157,7 @@ mod tests {
         let nudge_count = result
             .messages
             .iter()
-            .filter(|m| matches!(m, AgentMessage::System { content, .. } if content == PLAIN_TEXT_NUDGE_CONTEXT))
+            .filter(|m| matches!(m, AgentMessage::System { content, .. } if content == crate::protocol::DEFAULT_PLAIN_TEXT_RECOVERY_PROMPT))
             .count();
         assert_eq!(
             nudge_count, 2,
@@ -2203,6 +2239,7 @@ mod tests {
             .stream(stream.clone())
             .model_id("auto-tool-provider")
             .tools(tool_registry)
+            .protocol_policy(Arc::new(TestTerminalPolicy))
             .tool_gate_arc(Arc::new(TerminalWithStatusGate))
             .plain_text_terminal_fallback_tool("message_result")
             .empty_outcome_retry_budget(0)

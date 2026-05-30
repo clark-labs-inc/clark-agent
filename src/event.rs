@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use crate::stream::{AssistantStreamChunk, ToolSchema};
 use crate::tool::ToolResult;
-use crate::types::{AgentMessage, AssistantBlock, RunIdentity, ToolResultBlock, UserBlock, UserContent};
+use crate::types::{
+    AgentMessage, AssistantBlock, RunIdentity, ToolResultBlock, UserBlock, UserContent,
+};
 
 /// All events the loop emits.
 ///

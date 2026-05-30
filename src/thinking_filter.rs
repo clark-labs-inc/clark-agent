@@ -1,9 +1,8 @@
 //! Streaming filter that splits assistant text into a hidden
 //! `<thought>` channel and visible content.
 //!
-//! The model is prompted (see `clark-agent-bridge/src/base_prompt.txt`,
-//! `<thought_rules>`) to begin every turn with exactly one
-//! `<thought>...</thought>` block (private scratch space — the typed
+//! A host typically prompts the model to begin every turn with exactly
+//! one `<thought>...</thought>` block (private scratch space — the typed
 //! record this filter extracts and routes off the visible stream),
 //! optionally followed by a short `<narrate>...</narrate>` sentence
 //! (user-visible diary text), and then the tool call(s). Emitting

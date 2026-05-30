@@ -27,6 +27,9 @@
 //! - [`plugin`] — `Plugin` + capability traits (`BeforeToolCall`,
 //!   `AfterToolCall`, `ContextTransform`, `EventObserver`, `SteeringSource`).
 //!   Cross-cutting concerns register here, not inline in the loop.
+//! - [`protocol`] — `ProtocolPolicy`. The seam for product-specific tool
+//!   vocabulary (recovery prose, tool-call alias repair, hidden-tool errors).
+//!   The core ships a generic default that names no tools.
 //! - [`config`] — `LoopConfig` + `AgentBuilder` for assembling everything.
 //! - [`mod@run`] — [`run()`] / [`run_continue()`] — the canonical loop. Pure functions.
 //! - [`exec`] — tool execution: parallel + sequential dispatch, hook plumbing.
@@ -40,6 +43,7 @@ pub mod event;
 pub mod exec;
 pub mod plugin;
 pub mod plugins;
+pub mod protocol;
 pub mod reasoning;
 pub mod run;
 pub mod stream;
@@ -51,6 +55,7 @@ pub mod tool_result_budget;
 pub mod trajectory;
 pub mod types;
 
+pub use budget::TokenBudget;
 pub use config::{
     AgentBuilder, LoopConfig, MaxTokensRecovery, PluginNames, TokenScaling,
     DEFAULT_GRACE_ITERATIONS,
@@ -64,6 +69,10 @@ pub use plugin::{
     EventObserver, FollowUpSource, Plugin, SteeringSource, TransformContext,
 };
 pub use plugins::GracefulTurnLimit;
+pub use protocol::{
+    DefaultProtocolPolicy, HiddenToolContext, HiddenToolError, PlainTextRecoveryContext,
+    ProtocolPolicy, DEFAULT_PLAIN_TEXT_RECOVERY_PROMPT,
+};
 pub use reasoning::{
     audit_replay, OpenRouterReasoningCodec, ReasoningCodec, ReasoningFormat, ReasoningItem,
     ReplayAudit, ReplayContract, ReplayViolation,
@@ -83,11 +92,10 @@ pub use tool_identity::{
     extract_args_key, extract_operation_key, extract_target, ArgsKeyFn, TargetExtractor, TargetFn,
     ToolIdentityPolicy,
 };
-pub use budget::TokenBudget;
 pub use tool_result_budget::{ToolResultBudget, DEFAULT_PER_TOOL_CHARS};
 pub use trajectory::{
     InMemoryTrajectorySink, TrajectoryError, TrajectoryPayload, TrajectoryRecord,
-    TrajectoryRecorder, TrajectorySink,
+    TrajectoryRecorder, TrajectorySink, TRAJECTORY_SCHEMA_VERSION,
 };
 pub use types::{
     AgentContext, AgentMessage, AssistantBlock, AssistantContent, ImageContent,

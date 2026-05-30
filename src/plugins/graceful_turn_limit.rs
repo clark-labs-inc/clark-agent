@@ -10,9 +10,9 @@
 //! agent gets no signal that the answer is partial.
 //!
 //! This plugin adds a single steering message a few iterations before the
-//! cap: a host-provided wrap-up instruction, defaulting to *"You have used
-//! your turn budget. Stop calling work tools and call `message_result`
-//! now."* If the model complies, the run ends naturally
+//! cap: a host-provided wrap-up instruction, defaulting to a generic *"You
+//! have used your turn budget. Stop calling work tools and deliver your
+//! final result now."* If the model complies, the run ends naturally
 //! with a clean close-out and the loop reports
 //! [`LoopOutcome::WrappedUp`](crate::run::LoopOutcome::WrappedUp). If the
 //! model ignores the warning, the existing hard cap still fires.
@@ -44,33 +44,34 @@ use crate::types::AgentMessage;
 type MessageProvider = Arc<dyn Fn() -> String + Send + Sync>;
 /// Host-supplied callback that returns the desired grace window at
 /// fire-check time. Lets hosts scale the wrap-up window to the size of
-/// the work in flight (e.g. "leave at least 2 × open_phase_count + 2
-/// iterations for plan close-out") without leaking host types into
+/// the work in flight (e.g. "leave at least 2 × open-work-item-count + 2
+/// iterations for close-out") without leaking host types into
 /// `clark-agent`. The callback is invoked on every steering poll, so
 /// keep it cheap: a single `Mutex::lock` + count, no I/O.
 type GraceProvider = Arc<dyn Fn() -> usize + Send + Sync>;
 
 /// Wrap-up steering text injected when the soft limit fires.
 ///
-/// Phrased as a directive, not a suggestion — pi-subagents found that
-/// hedged language ("you might want to wrap up") is reliably ignored,
-/// while a clear stop-and-summarize instruction lands. The closing
-/// bullets prompt the model to surface what it accomplished and what
-/// remains so the parent agent can act on partial results.
+/// Phrased as a directive, not a suggestion — hedged language ("you might
+/// want to wrap up") is reliably ignored, while a clear stop-and-summarize
+/// instruction lands. The closing bullets prompt the model to surface what
+/// it accomplished and what remains so a parent agent can act on partial
+/// results.
 ///
-/// The wrap-up still has to go through Clark's terminal-message contract:
-/// plain assistant text is invisible, so the model must call `message_result`
-/// (or `message_ask` if a user answer is genuinely required).
+/// Generic by design: it names no specific tool. Hosts whose protocol
+/// requires delivery through a named tool (and whose plain assistant text
+/// is invisible) should override this via
+/// [`crate::AgentBuilder::graceful_turn_limit_message_provider`] to name
+/// their delivery tool.
 const DEFAULT_WRAP_UP_MESSAGE: &str = "\
-You have used your turn budget. Stop calling work tools and deliver now with \
-`message_result`. Summarize:\n\
+You have used your turn budget. Stop calling work tools and deliver your \
+final result now. Summarize:\n\
 - What you accomplished.\n\
 - What remains unfinished, if anything.\n\
 - Any partial findings the caller should know about.\n\
 \n\
-Then stop. Do not call any more work tools. If a user answer is genuinely \
-required before you can continue, call `message_ask` with one concrete \
-question instead.";
+Then stop. Do not call any more work tools. Ask for input only if a user \
+answer is genuinely required before you can continue.";
 
 /// Soft pre-cap warning. See module docs.
 pub struct GracefulTurnLimit {
@@ -103,9 +104,9 @@ pub struct GracefulTurnLimit {
     /// the threshold.
     fired: Arc<AtomicBool>,
 
-    /// Host-specific wrap-up wording. Clark sessions use this to make
-    /// the warning plan-aware without teaching the agent core about
-    /// Clark's `PlanState` type.
+    /// Host-specific wrap-up wording. A host uses this to make the
+    /// warning aware of its own work-tracking state without teaching the
+    /// agent core about host-specific types.
     message_provider: MessageProvider,
 }
 
@@ -135,12 +136,7 @@ impl GracefulTurnLimit {
         grace_iterations: usize,
         message_provider: MessageProvider,
     ) -> Option<Self> {
-        Self::from_hard_cap_with_providers(
-            max_iterations,
-            grace_iterations,
-            message_provider,
-            None,
-        )
+        Self::from_hard_cap_with_providers(max_iterations, grace_iterations, message_provider, None)
     }
 
     /// Build with host-provided wrap-up wording AND a dynamic grace
@@ -231,7 +227,7 @@ impl SteeringSource for GracefulTurnLimit {
         // one turn late, never twice. `soft_limit()` recomputes from
         // the dynamic grace provider on each poll, so a host can grow
         // the wrap-up window as the work in flight grows (e.g. more
-        // open plan phases mean more iterations needed to deliver a
+        // open work items mean more iterations needed to deliver a
         // partial answer cleanly).
         if self.turns_completed.load(Ordering::Relaxed) < self.soft_limit() {
             return Vec::new();
@@ -316,7 +312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrap_up_points_to_terminal_message_tool() {
+    async fn default_wrap_up_is_generic_and_directs_delivery() {
         let plugin = GracefulTurnLimit::from_hard_cap(10, 3).unwrap();
         for _ in 0..7 {
             plugin.on_event(&turn_end()).await;
@@ -326,12 +322,14 @@ mod tests {
             panic!("expected system wrap-up message");
         };
 
-        assert!(text.contains("`message_result`"), "{text}");
-        assert!(
-            !text.contains("write your final answer in this message"),
-            "{text}"
-        );
-        assert!(!text.contains("Do not call any more tools."), "{text}");
+        // Directs the model to stop and deliver...
+        assert!(text.contains("deliver your final result"), "{text}");
+        assert!(text.contains("Stop calling work tools"), "{text}");
+        // ...without leaking any product-specific tool vocabulary. Hosts
+        // override via `graceful_turn_limit_message_provider` to name a
+        // delivery tool.
+        assert!(!text.contains("message_result"), "{text}");
+        assert!(!text.contains("message_ask"), "{text}");
     }
 
     #[tokio::test]
@@ -367,9 +365,8 @@ mod tests {
     #[tokio::test]
     async fn dynamic_grace_provider_widens_wrap_up_window_for_bigger_jobs() {
         // The host-supplied callback returns the grace window the
-        // plugin should use at fire-check time. This lets Clark
-        // scale wrap-up budget with plan size (see
-        // `clark-agent-bridge/src/session.rs::build_loop_config`).
+        // plugin should use at fire-check time. This lets a host scale
+        // the wrap-up budget with the size of the work in flight.
         let grace = Arc::new(std::sync::Mutex::new(3usize));
         let grace_for_provider = grace.clone();
         let plugin = GracefulTurnLimit::from_hard_cap_with_providers(

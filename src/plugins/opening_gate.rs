@@ -1,70 +1,48 @@
 //! `OpeningGate` — narrow the very first LLM call's tool list to a
-//! framing/delivery/clarification subset
-//! (`[message_result, message_info, plan, message_ask]`).
+//! caller-supplied subset.
 //!
-//! Pairs with the `<agent_loop>` prompt sentence telling the model
-//! that its first response must call one of those tools. Two contracts
-//! together: the gate enforces it on the wire, the prompt explains it
-//! in prose. The model behaves predictably even when the system prompt
-//! is partially ignored, because the wire-level constraint is harder
-//! to ignore than text instructions.
+//! A common product pattern is "the model must frame / plan / clarify on
+//! its opening turn before any work tools are available." This gate
+//! enforces that on the wire: on iteration 0 it advertises only the tools
+//! whose names are in the configured allowlist (intersected with the tools
+//! the registry actually has); from iteration 1 on it imposes no
+//! narrowing. Pair it with a system-prompt sentence that explains the
+//! same contract in prose — the wire-level constraint is harder for a
+//! model to ignore than text instructions.
 //!
-//! ## Why restored
-//!
-//! An earlier version of this gate also offered a `PerConversation`
-//! scope backed by a `ConversationGateRegistry`. The 2026-05-02
-//! migration pulled the gate AND the registry without a replacement,
-//! which in turn caused models to skip planning entirely on every
-//! eval matrix run (no plan call → no capability tags → downstream
-//! `CapabilityGate` and `WorkProgressHook` machinery never engages).
-//!
-//! This restoration ships the simpler per-run-only flavor. The
-//! per-conversation scope can come back when the registry trait is
-//! reintroduced; in the meantime, per-run is the default that was
-//! enabled in production for months and the one matrix scenarios
-//! depend on.
+//! The gate ships **no** default allowlist: it is vocabulary-free, so the
+//! core stays free of any product's tool names. Callers supply the
+//! opening subset via [`OpeningGate::with_allowlist`]. Composes with other
+//! [`ToolGate`] plugins through allowlist intersection.
 
 use async_trait::async_trait;
 use std::collections::HashSet;
 
 use crate::plugin::{Plugin, PluginCapabilities, ToolGate, ToolGateContext};
 
-/// Default opener allowlist: direct delivery, framing tools, and genuine
-/// clarification.
-/// Excludes every other tool — no browsing, no file work, no shell, no
-/// sandbox work — until after the opening turn.
-fn default_opener_allowlist() -> HashSet<String> {
-    ["message_result", "message_info", "plan", "message_ask"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-}
-
-/// Narrows iteration 0's tool advertisement to a framing subset.
+/// Narrows iteration 0's tool advertisement to a caller-supplied subset.
 /// Composes via allowlist intersection with other `ToolGate` plugins.
 pub struct OpeningGate {
     allowlist: HashSet<String>,
 }
 
 impl OpeningGate {
-    /// Construct a gate using the default acknowledgement allowlist
-    /// (`[message_result, message_info, plan, message_ask]`).
-    pub fn for_acknowledgement() -> Self {
-        Self {
-            allowlist: default_opener_allowlist(),
-        }
-    }
-
-    /// Construct a gate with a custom allowlist. Use only when an
-    /// experiment needs a different opening contract.
+    /// Construct a gate that narrows the opening turn to `allowlist`.
+    /// The names are product-specific and supplied by the caller — the
+    /// gate itself knows no tool vocabulary.
     pub fn with_allowlist(allowlist: HashSet<String>) -> Self {
         Self { allowlist }
     }
-}
 
-impl Default for OpeningGate {
-    fn default() -> Self {
-        Self::for_acknowledgement()
+    /// Convenience constructor from an iterator of tool names.
+    pub fn new<I, S>(tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            allowlist: tools.into_iter().map(Into::into).collect(),
+        }
     }
 }
 
@@ -112,30 +90,29 @@ mod tests {
 
     #[tokio::test]
     async fn gate_fires_on_iteration_zero_with_intersection() {
-        let gate = OpeningGate::for_acknowledgement();
+        // A product allowlist of framing tools; work tools must be hidden
+        // on the opening turn.
+        let gate = OpeningGate::new(["frame", "deliver", "ask"]);
         let allowed = gate
             .next_turn_tool_allowlist(ctx(
                 0,
                 &[
-                    "plan",
-                    "message_result",
-                    "message_info",
-                    "message_ask",
-                    "skill",
+                    "frame",
+                    "deliver",
+                    "ask",
+                    "load_skill",
                     "shell",
                     "file_write",
-                    "update_working_checkpoint",
                 ],
             ))
             .await
             .expect("opening turn should narrow");
-        assert!(allowed.contains("plan"));
-        assert!(allowed.contains("message_result"));
-        assert!(allowed.contains("message_info"));
-        assert!(allowed.contains("message_ask"));
+        assert!(allowed.contains("frame"));
+        assert!(allowed.contains("deliver"));
+        assert!(allowed.contains("ask"));
         assert!(
-            !allowed.contains("skill"),
-            "opening turn must hide skill loading until after the initial plan"
+            !allowed.contains("load_skill"),
+            "opening turn must hide non-framing tools"
         );
         assert!(
             !allowed.contains("shell"),
@@ -145,17 +122,13 @@ mod tests {
             !allowed.contains("file_write"),
             "opening turn must hide work tools"
         );
-        assert!(
-            !allowed.contains("update_working_checkpoint"),
-            "checkpoint tool is hidden in the opening turn — model can call it after the initial plan"
-        );
     }
 
     #[tokio::test]
     async fn gate_returns_none_after_first_iteration() {
-        let gate = OpeningGate::for_acknowledgement();
+        let gate = OpeningGate::new(["frame", "shell"]);
         let result = gate
-            .next_turn_tool_allowlist(ctx(1, &["plan", "shell"]))
+            .next_turn_tool_allowlist(ctx(1, &["frame", "shell"]))
             .await;
         assert!(
             result.is_none(),
@@ -165,33 +138,32 @@ mod tests {
 
     #[tokio::test]
     async fn allowlist_does_not_synthesize_tools_missing_from_registry() {
-        // Test fixture only has message_ask, message_result, and shell.
-        // Even though the gate would normally allow plan/message_info,
-        // they aren't in the registry — don't fabricate them on the wire.
-        let gate = OpeningGate::for_acknowledgement();
+        // The gate would allow `frame`/`deliver`, but only `ask`/`deliver`
+        // and `shell` are in the registry — don't fabricate names on the
+        // wire.
+        let gate = OpeningGate::new(["frame", "deliver", "ask"]);
         let allowed = gate
-            .next_turn_tool_allowlist(ctx(0, &["message_ask", "message_result", "shell"]))
+            .next_turn_tool_allowlist(ctx(0, &["ask", "deliver", "shell"]))
             .await
             .unwrap();
         assert_eq!(allowed.len(), 2);
-        assert!(allowed.contains("message_ask"));
-        assert!(allowed.contains("message_result"));
-        assert!(!allowed.contains("plan"));
-        assert!(!allowed.contains("message_info"));
+        assert!(allowed.contains("ask"));
+        assert!(allowed.contains("deliver"));
+        assert!(!allowed.contains("frame"));
         assert!(!allowed.contains("shell"));
     }
 
     #[tokio::test]
-    async fn custom_allowlist_overrides_default() {
+    async fn with_allowlist_takes_an_explicit_set() {
         let mut custom = HashSet::new();
-        custom.insert("plan".to_string());
+        custom.insert("frame".to_string());
         let gate = OpeningGate::with_allowlist(custom);
         let allowed = gate
-            .next_turn_tool_allowlist(ctx(0, &["plan", "message_info", "message_ask"]))
+            .next_turn_tool_allowlist(ctx(0, &["frame", "deliver", "ask"]))
             .await
             .unwrap();
         assert_eq!(allowed.len(), 1);
-        assert!(allowed.contains("plan"));
-        assert!(!allowed.contains("message_info"));
+        assert!(allowed.contains("frame"));
+        assert!(!allowed.contains("deliver"));
     }
 }

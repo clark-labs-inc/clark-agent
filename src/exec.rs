@@ -87,16 +87,14 @@ pub(crate) async fn execute_tool_batch(
         });
     }
 
-    // Redirect "invented" plan-action tool names (`set`, `update`,
-    // `advance`) to the canonical `plan(action=..., ...)` form. The
-    // model routinely emits `advance(evidence="…")` when it should
-    // be `plan(action="advance", evidence="…")` — observed 3× in the
-    // finance-agent-v2 trajectories. Without this repair the call
-    // bounces with `Tool 'advance' not found` and the agent burns
-    // a turn rewriting; with it, the call lands and the plan tool
-    // dispatches to the same advance handler it would have anyway.
+    // Let the active protocol policy normalize the batch before registry
+    // lookup — e.g. fold a product's known alias names into a canonical
+    // tool. The default policy is a no-op; the core performs no alias
+    // repair of its own, so no product tool vocabulary lives here.
     let mut tool_calls = tool_calls;
-    redirect_plan_action_aliases(&mut tool_calls, &config.tools);
+    config
+        .protocol
+        .normalize_tool_calls(&mut tool_calls, &config.tools);
 
     let total_tool_calls = tool_calls.len();
     let limit_counted_tool_calls = count_limit_counted_tool_calls(&tool_calls, &config.tools);
@@ -191,51 +189,6 @@ pub(crate) async fn execute_tool_batch(
     Ok(batch)
 }
 
-/// Plan actions a model sometimes emits as standalone tool names.
-/// The canonical form is `plan(action="<name>", …)`; without this
-/// rewrite the call fails with `Tool '<name>' not found`.
-const PLAN_ACTION_ALIASES: &[&str] = &["set", "update", "advance"];
-
-/// Rewrite tool calls that target a known plan-action alias into the
-/// canonical `plan(action="<alias>", …)` shape. Side-effects:
-///
-/// * `call.name` becomes `"plan"`.
-/// * `call.arguments.action` is set to the original name (only when
-///   absent — never overrides an explicit action).
-///
-/// The repair is a no-op unless ALL three conditions hold:
-///   1. `plan` is registered in the tool registry,
-///   2. the alias name is NOT registered as its own tool (so a
-///      future tool literally named `advance` would shadow this
-///      repair, not be overwritten by it), and
-///   3. `call.arguments` is a JSON object (we never invent
-///      structure on top of a non-object value).
-fn redirect_plan_action_aliases(
-    tool_calls: &mut [ToolCall],
-    tools: &crate::tool::ToolRegistry,
-) -> usize {
-    if tools.get("plan").is_none() {
-        return 0;
-    }
-    let mut count = 0usize;
-    for call in tool_calls.iter_mut() {
-        if !PLAN_ACTION_ALIASES.contains(&call.name.as_str()) {
-            continue;
-        }
-        if tools.get(&call.name).is_some() {
-            continue;
-        }
-        let alias = call.name.clone();
-        if let Value::Object(map) = &mut call.arguments {
-            map.entry("action".to_string())
-                .or_insert_with(|| Value::String(alias.clone()));
-            call.name = "plan".to_string();
-            count += 1;
-        }
-    }
-    count
-}
-
 fn split_tool_calls_for_execution(
     tool_calls: Vec<ToolCall>,
     tools: &crate::tool::ToolRegistry,
@@ -254,10 +207,11 @@ fn split_tool_calls_for_execution(
     let mut executed_counted = 0usize;
     for call in tool_calls {
         if !tool_counts_toward_call_limit(tools, &call.name) {
-            // Progress-only tools and parallel-safe reads never burn the
-            // per-turn cap; let them all through (see
-            // `AgentTool::counts_toward_tool_call_limit` and
-            // `AgentTool::parallel_safe_per_turn`).
+            // Progress-only tools, parallel-safe reads, and malformed calls
+            // that resolve to no registered tool never burn the per-turn cap;
+            // let them all through (see `tool_counts_toward_call_limit`). A
+            // malformed call still lands as a synthetic "no such tool" error
+            // in `prepare_call`; it just cannot preempt a real call's slot.
             executable.push(call);
         } else if executed_counted < max_tool_calls {
             executed_counted += 1;
@@ -281,16 +235,35 @@ fn count_limit_counted_tool_calls(
 
 /// Whether a tool consumes a slot from the per-turn cap.
 ///
-/// A tool is exempt from the cap when EITHER it opts out of the cap
-/// (progress-only signals like `message_info`) OR it is marked
-/// parallel-safe (idempotent reads like `web_search`, `file_read`,
-/// `grep`, `glob`). Unknown / unregistered names default to "counted"
-/// so a stray call cannot quietly bypass the budget.
+/// A call is exempt from the cap when ANY of these hold:
+/// - it opts out of the cap (progress-only signals that report status
+///   without doing work — see [`AgentTool::counts_toward_tool_call_limit`]);
+/// - it is marked parallel-safe (idempotent reads like `web_search`,
+///   `file_read`, `grep`, `glob`);
+/// - it does not resolve to a registered tool at all — an empty/blank name,
+///   or a name no tool exists for.
+///
+/// The last case is the load-bearing one. A call that resolves to no tool
+/// does NO real work: `prepare_call` short-circuits it to a synchronous
+/// "no such tool" error result without ever invoking a tool. Counting it
+/// would let a glitch — e.g. a streamed tool call that arrived with an empty
+/// `name` — spend the turn's only slot and bump a *real* call into the
+/// unexecuted bin. That was observed in production: under
+/// `max_tool_calls_per_turn = 1`, an empty-name call preempted the model's
+/// real next call. A malformed call must never preempt real work; it still
+/// surfaces its error so the model can react next turn.
+///
+/// Note this is the opposite of the *termination*-vote rule: there, an
+/// unresolved name DOES count (see `tool_counts_toward_termination_vote`),
+/// so a stray call cannot accidentally end the run. The asymmetry is
+/// intentional — a malformed call does no work (so it must not spend the
+/// work budget) and is not a satisfied terminator (so it must not vote to
+/// stop).
 fn tool_counts_toward_call_limit(tools: &crate::tool::ToolRegistry, name: &str) -> bool {
     tools
         .get(name)
         .map(|tool| tool.counts_toward_tool_call_limit() && !tool.parallel_safe_per_turn())
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 /// Whether a tool's terminate vote is counted in the unanimous-vote
@@ -311,17 +284,14 @@ fn tool_counts_toward_termination_vote(tools: &crate::tool::ToolRegistry, name: 
 /// - at least one *counted* tool is present, AND
 /// - every counted tool voted `terminate: true`.
 ///
-/// An all-advisory batch (e.g. only `message_info` calls) returns
+/// An all-advisory batch (e.g. only progress-note calls) returns
 /// `false` because no counted tool voted yes — progress notes never
 /// end the run on their own.
 ///
 /// When the batch terminates AND advisory siblings were skipped from
-/// the tally, emits a structured `tracing::info` line so we can
-/// measure how often the broad-gate fix actually fires in production.
-/// The expected steady state once the prompt clauses on
-/// `message_info` / `message_result` / `message_ask` propagate is
-/// near-zero — a non-zero rate names which model still needs the
-/// fallback safety net.
+/// the tally, emits a structured `tracing::info` line so operators can
+/// measure how often this fallback actually fires in production — a
+/// non-zero rate names which model still needs the safety net.
 fn compute_batch_terminate<'a, I>(tools: &crate::tool::ToolRegistry, votes: I) -> bool
 where
     I: IntoIterator<Item = (&'a str, bool)>,
@@ -763,8 +733,9 @@ pub(crate) struct FinalizedOutcome {
 
 /// Walk every registered `ToolGate` and ask each for a specific reason
 /// it denies `tool_name`. Returns the first specific reason; `None` if
-/// no gate claims responsibility (caller should fall back to the
-/// shape-based `hidden_tool_error_message`).
+/// no gate claims responsibility (caller falls back to the active
+/// [`crate::protocol::ProtocolPolicy`], then to the core's generic
+/// hidden-tool message).
 struct GateDenial {
     reason: String,
     gate: &'static str,
@@ -797,219 +768,6 @@ async fn gate_attributed_denial(
     None
 }
 
-fn hidden_tool_error_message(
-    tool_name: &str,
-    allowlist: &std::collections::HashSet<String>,
-) -> String {
-    let allowed_preview = allowed_tools_preview(allowlist);
-    if is_final_delivery_allowlist(allowlist) {
-        return format!(
-            "Tool `{tool_name}` is hidden because this recovery turn is limited to final \
-             message tools. Call `message_result` to deliver what is ready, or \
-             `message_ask` only for a genuinely blocking user-owned input. \
-             Available now: [{allowed_preview}]."
-        );
-    }
-
-    if is_plan_repair_allowlist(allowlist) {
-        return format!(
-            "Tool `{tool_name}` is hidden because the active plan phase has no valid \
-             capability profile. Call `plan(action=\"update\")` to repair or obsolete \
-             the active phase with a reason before doing more work. \
-             Available now: [{allowed_preview}]."
-        );
-    }
-
-    if is_wrap_up_delivery_allowlist(allowlist) {
-        return format!(
-            "Tool `{tool_name}` is hidden because this turn is limited to wrap-up tools. \
-             Call `message_result` to deliver what is ready, `message_ask` only for a \
-             genuinely blocking user-owned input, or `plan(action=\"advance\")` / \
-             `plan(action=\"update\")` to close or repair the active phase. \
-             Available now: [{allowed_preview}]."
-        );
-    }
-
-    if is_opening_or_pre_plan_allowlist(allowlist) {
-        return format!(
-            "Tool `{tool_name}` is a work tool, but this turn is still before the \
-             initial work plan. Call `plan(action=\"set\")`; work tools become \
-             available after the plan chooses phase capabilities. \
-             Available now: [{allowed_preview}]."
-        );
-    }
-
-    if is_phase_narrowing_allowlist(allowlist) {
-        return format!(
-            "Tool `{tool_name}` is hidden by the active plan phase's capability profile. \
-             Use an available tool for the current phase, or call \
-             `plan(action=\"update\")` if the active phase is wrong or stale so you can \
-             repair or obsolete it with a reason. Available now: [{allowed_preview}]. \
-             Recovery example: {plan_update_example}",
-            plan_update_example = plan_update_example_for(tool_name),
-        );
-    }
-
-    format!(
-        "Tool `{tool_name}` is not available in this narrowed turn. Use one of the \
-         tools available now, or repair the plan if the current phase is wrong. \
-         Available now: [{allowed_preview}]."
-    )
-}
-
-/// Renders a copy-pasteable `plan(action="update", ...)` invocation that
-/// names the tool the model just tried to use. Weaker models (qwen-class)
-/// frequently retry a hidden tool 2-3 times before adapting; surfacing a
-/// concrete recovery payload cuts that wasted-turn loop in half.
-fn plan_update_example_for(blocked_tool: &str) -> String {
-    // Map the blocked tool to its natural plan capability. The capability
-    // names are the closed enum the planner accepts (research / build /
-    // author / browse / engineer).
-    let capability = match blocked_tool {
-        // Browser tools fit the "browse" capability.
-        name if name.starts_with("browser") => "browse",
-        // Web search / dataset retrieval / external evidence gathering.
-        "web_search" | "fetch" | "retrieve" => "research",
-        // Workspace and code edits.
-        "file_write" | "file_edit" | "shell" | "office" => "engineer",
-        // Prose/visual composition tools.
-        "presentation" | "document" => "author",
-        // Fallback: research is the broadest external-evidence bucket.
-        _ => "research",
-    };
-    format!(
-        "`plan(action=\"update\", reason=\"Need `{blocked_tool}` to continue\", \
-         add_phases=[{{\"title\": \"Use `{blocked_tool}`\", \
-         \"primary_capability\": \"{capability}\"}}])`"
-    )
-}
-
-fn allowed_tools_preview(allowlist: &std::collections::HashSet<String>) -> String {
-    let mut allowed: Vec<&str> = allowlist.iter().map(String::as_str).collect();
-    allowed.sort_unstable();
-    if allowed.len() > 12 {
-        format!("{}, … ({} total)", allowed[..12].join(", "), allowed.len())
-    } else {
-        allowed.join(", ")
-    }
-}
-
-fn is_final_delivery_allowlist(allowlist: &std::collections::HashSet<String>) -> bool {
-    !allowlist.is_empty()
-        && !allowlist.contains("plan")
-        && allowlist.iter().all(|tool| {
-            matches!(
-                tool.as_str(),
-                "message_result" | "message_ask" | "message_info" | "terminator"
-            )
-        })
-}
-
-fn is_plan_repair_allowlist(allowlist: &std::collections::HashSet<String>) -> bool {
-    !allowlist.is_empty() && allowlist.iter().all(|tool| tool == "plan")
-}
-
-fn is_wrap_up_delivery_allowlist(allowlist: &std::collections::HashSet<String>) -> bool {
-    !allowlist.is_empty()
-        && allowlist.contains("message_result")
-        && allowlist.contains("plan")
-        && !allowlist.contains("message_info")
-        && allowlist.iter().all(|tool| {
-            matches!(
-                tool.as_str(),
-                "message_result" | "message_ask" | "plan" | "terminator"
-            )
-        })
-}
-
-fn is_opening_or_pre_plan_allowlist(allowlist: &std::collections::HashSet<String>) -> bool {
-    allowlist.contains("plan")
-        && allowlist.iter().all(|tool| {
-            matches!(
-                tool.as_str(),
-                "plan"
-                    | "message_result"
-                    | "message_info"
-                    | "message_ask"
-                    | "update_working_checkpoint"
-            )
-        })
-}
-
-fn is_phase_narrowing_allowlist(allowlist: &std::collections::HashSet<String>) -> bool {
-    allowlist.contains("plan")
-        && allowlist
-            .iter()
-            .any(|tool| !is_opening_or_pre_plan_tool(tool.as_str()))
-}
-
-fn is_opening_or_pre_plan_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "plan" | "message_result" | "message_info" | "message_ask" | "update_working_checkpoint"
-    )
-}
-
-fn hidden_tool_error_details(
-    tool_name: &str,
-    allowlist: &std::collections::HashSet<String>,
-    gate: Option<&'static str>,
-) -> Value {
-    let kind = hidden_tool_error_kind(allowlist, gate);
-    let mut allowed_tools: Vec<&str> = allowlist.iter().map(String::as_str).collect();
-    allowed_tools.sort_unstable();
-
-    json!({
-        "runtime_block": true,
-        "kind": kind,
-        "gate": gate.unwrap_or("tool_gate"),
-        "requested_tool": tool_name,
-        "allowed_tools": allowed_tools,
-        "repair_actions": repair_actions_for_hidden_tool_kind(kind),
-    })
-}
-
-fn hidden_tool_error_kind(
-    allowlist: &std::collections::HashSet<String>,
-    gate: Option<&'static str>,
-) -> &'static str {
-    match gate {
-        Some("capability_gate") => "tool_not_in_focus",
-        Some("delivery_repair_gate") => "delivery_repair_tool_blocked",
-        Some("website_scaffold_gate") => "website_scaffold_tool_blocked",
-        Some("workflow_instance_gate") => "workflow_instance_tool_blocked",
-        Some("max_tool_call_gate") => "tool_disabled_by_scenario",
-        _ if is_final_delivery_allowlist(allowlist) => "final_delivery_tool_blocked",
-        _ if is_plan_repair_allowlist(allowlist) => "plan_phase_missing_capability",
-        _ if is_wrap_up_delivery_allowlist(allowlist) => "wrap_up_tool_blocked",
-        _ if is_opening_or_pre_plan_allowlist(allowlist) => "pre_plan_work_tool",
-        _ if is_phase_narrowing_allowlist(allowlist) => "tool_not_in_focus",
-        _ => "tool_not_available",
-    }
-}
-
-fn repair_actions_for_hidden_tool_kind(kind: &str) -> Vec<&'static str> {
-    match kind {
-        "pre_plan_work_tool" => vec!["plan.set"],
-        "plan_phase_missing_capability" => vec!["plan.update", "message_result", "message_ask"],
-        "final_delivery_tool_blocked" => vec!["message_result", "message_ask"],
-        "wrap_up_tool_blocked" => vec![
-            "message_result",
-            "message_ask",
-            "plan.advance",
-            "plan.update",
-        ],
-        "tool_not_in_focus" => vec!["retry_after_schema_load", "plan.advance", "plan.update"],
-        "delivery_repair_tool_blocked" => {
-            vec!["complete_required_repair", "message_result", "plan.update"]
-        }
-        "website_scaffold_tool_blocked" => vec!["browser_qa", "publish", "plan.update"],
-        "workflow_instance_tool_blocked" => vec!["use_required_producer", "plan.update"],
-        "tool_disabled_by_scenario" => vec!["message_result"],
-        _ => vec!["use_allowed_tool", "plan.update"],
-    }
-}
-
 async fn prepare_call(
     assistant: &AgentMessage,
     assistant_content: &AssistantContent,
@@ -1028,22 +786,48 @@ async fn prepare_call(
     // Hard-enforce per-turn `ToolGate` narrowing. The allowlist filters
     // what schemas the model SEES; without this check, the model can
     // hallucinate a tool name that wasn't advertised this turn and the
-    // dispatcher runs it anyway because the registry is global. That's
-    // how the matrix run caught Gemini calling `message_result` after
-    // the no-work narrowing dropped it from the catalog — the model
-    // claimed success without doing any work, the runtime ran the
-    // terminator, and the file the model claimed it created didn't
-    // exist. Refuse here so the model sees a typed tool error and
+    // dispatcher runs it anyway because the registry is global. That was
+    // observed in production: a model called a terminal delivery tool
+    // after a no-work narrowing had dropped it from the catalog, claimed
+    // success without doing any work, and the file it claimed to create
+    // didn't exist. Refuse here so the model sees a typed tool error and
     // either picks an allowed tool or surfaces an unrecoverable state.
+    //
+    // Message + details are sourced in priority order:
+    //   1. a `ToolGate` that attributes the denial via `denial_reason`;
+    //   2. the active `ProtocolPolicy` (product vocabulary, if any);
+    //   3. the core's generic, vocabulary-free fallback.
     if let Some(allowlist) = turn_allowlist {
         if !allowlist.contains(call.name.as_str()) {
             let attributed = gate_attributed_denial(&call.name, config, &context.messages).await;
-            let (reason, gate) = match attributed {
-                Some(denial) => (denial.reason, Some(denial.gate)),
-                None => (hidden_tool_error_message(&call.name, allowlist), None),
-            };
-            let mut result = ToolResult::error(reason);
-            result.details = hidden_tool_error_details(&call.name, allowlist, gate);
+            let (message, details) =
+                match attributed {
+                    Some(denial) => {
+                        let details = crate::protocol::generic_hidden_tool_details(
+                            &call.name,
+                            allowlist,
+                            Some(denial.gate),
+                        );
+                        (denial.reason, details)
+                    }
+                    None => match config.protocol.hidden_tool_error(
+                        crate::protocol::HiddenToolContext {
+                            requested_tool: &call.name,
+                            allowlist,
+                            messages: &context.messages,
+                        },
+                    ) {
+                        Some(err) => (err.message, err.details),
+                        None => (
+                            crate::protocol::generic_hidden_tool_message(&call.name, allowlist),
+                            crate::protocol::generic_hidden_tool_details(
+                                &call.name, allowlist, None,
+                            ),
+                        ),
+                    },
+                };
+            let mut result = ToolResult::error(message);
+            result.details = details;
             return PreparedCall::Immediate(ExecutedOutcome {
                 result,
                 is_error: true,
@@ -1227,25 +1011,20 @@ fn outcome_to_message(call: &ToolCall, outcome: FinalizedOutcome) -> AgentMessag
         // history_repair) see the same prose the UI renders without
         // having to walk content blocks past densification headers.
         narration: outcome.result.narration,
-        // Carry the host-side structured payload so delivery gates
-        // and artifact dispatchers can read canonical fields
-        // (`html_url`, `artifacts: [...]`, …) without text-grepping
-        // the prose body. Stripped from provider wire formats —
-        // the model still sees `content` only.
+        // Carry the host-side structured payload so downstream plugins
+        // (delivery gates, artifact dispatchers, …) can read canonical
+        // fields without text-grepping the prose body. Stripped from
+        // provider wire formats — the model still sees `content` only.
         details,
         timestamp: Some(now_ms()),
     };
-    // C-3-a projection-mystery instrumentation. The post-AfterToolCall
-    // boundary is where any plugin-driven `override_result` has already
-    // landed. Logging the final content text head/tail at this point
-    // lets `RUST_LOG=clark_agent::exec::tool_result_built=debug`
-    // captures show what actually enters `messages` per turn — which
-    // is what `find_terminal_message` later walks. Pair with the same
-    // head/tail format in `MessageResultTool::run` (what the model
-    // emitted as `parsed.text`) and in
-    // `bridge::terminal::find_terminal_message` (what the terminal
-    // walker selects) to triangulate any divergence between the
-    // model's args and the user-visible final answer.
+    // Instrumentation: the post-`AfterToolCall` boundary is where any
+    // plugin-driven `override_result` has already landed. Logging the
+    // final content text head/tail at this point lets
+    // `RUST_LOG=clark_agent::exec::tool_result_built=debug` captures show
+    // what actually enters `messages` per turn — useful for triangulating
+    // any divergence between a tool's emitted args and the user-visible
+    // result a downstream terminal walker later selects.
     if let AgentMessage::ToolResult {
         content,
         is_error,
@@ -1367,7 +1146,6 @@ async fn emit_tool_end(config: &LoopConfig, call: &ToolCall, outcome: &Finalized
 mod tests {
     use super::*;
     use crate::ToolResultBlock;
-    use std::collections::HashSet;
     use std::sync::Arc;
 
     struct LimitTool {
@@ -1487,146 +1265,6 @@ mod tests {
         calls.iter().map(|call| call.name.as_str()).collect()
     }
 
-    fn allowlist(names: &[&str]) -> HashSet<String> {
-        names.iter().map(|name| (*name).to_string()).collect()
-    }
-
-    #[test]
-    fn hidden_tool_error_before_plan_points_to_plan_set() {
-        let message = hidden_tool_error_message(
-            "web_search",
-            &allowlist(&["message_ask", "message_info", "message_result", "plan"]),
-        );
-
-        assert!(
-            message.contains("before the initial work plan"),
-            "{message}"
-        );
-        assert!(message.contains("plan(action=\"set\")"), "{message}");
-        assert!(message.contains("work tools become available"), "{message}");
-    }
-
-    #[test]
-    fn hidden_tool_error_for_bad_active_phase_points_to_plan_update() {
-        let message = hidden_tool_error_message("shell", &allowlist(&["plan"]));
-
-        assert!(message.contains("no valid capability profile"), "{message}");
-        assert!(message.contains("plan(action=\"update\")"), "{message}");
-        assert!(message.contains("obsolete"), "{message}");
-    }
-
-    #[test]
-    fn hidden_tool_error_during_wrap_up_does_not_claim_pre_plan() {
-        let message = hidden_tool_error_message(
-            "browser_navigate",
-            &allowlist(&["message_ask", "message_result", "plan"]),
-        );
-
-        assert!(message.contains("wrap-up tools"), "{message}");
-        assert!(message.contains("message_result"), "{message}");
-        assert!(message.contains("plan(action=\"advance\")"), "{message}");
-        assert!(
-            !message.contains("before the initial work plan"),
-            "{message}"
-        );
-        assert!(!message.contains("plan(action=\"set\")"), "{message}");
-    }
-
-    #[test]
-    fn hidden_tool_error_during_phase_narrowing_points_to_phase_repair() {
-        let message = hidden_tool_error_message(
-            "publish",
-            &allowlist(&[
-                "message_result",
-                "message_info",
-                "plan",
-                "web_search",
-                "file_read",
-            ]),
-        );
-
-        assert!(message.contains("active plan phase"), "{message}");
-        assert!(message.contains("capability profile"), "{message}");
-        assert!(message.contains("wrong or stale"), "{message}");
-        assert!(message.contains("plan(action=\"update\")"), "{message}");
-    }
-
-    #[test]
-    fn hidden_tool_error_details_are_typed_runtime_block_payload() {
-        let details = hidden_tool_error_details(
-            "web_search",
-            &allowlist(&["message_result", "plan", "file_read", "shell"]),
-            Some("capability_gate"),
-        );
-
-        assert_eq!(details.get("runtime_block"), Some(&json!(true)));
-        assert_eq!(details.get("kind"), Some(&json!("tool_not_in_focus")));
-        assert_eq!(details.get("gate"), Some(&json!("capability_gate")));
-        assert_eq!(details.get("requested_tool"), Some(&json!("web_search")));
-        assert_eq!(
-            details.get("allowed_tools"),
-            Some(&json!(["file_read", "message_result", "plan", "shell"]))
-        );
-        assert_eq!(
-            details.get("repair_actions"),
-            Some(&json!([
-                "retry_after_schema_load",
-                "plan.advance",
-                "plan.update"
-            ]))
-        );
-    }
-
-    #[test]
-    fn hidden_tool_error_includes_copy_pasteable_plan_update_example() {
-        // Weaker models (qwen-class) retry a hidden tool 2-3 times before
-        // recovering. Surfacing a concrete recovery payload — capability
-        // mapped from the blocked tool — cuts that wasted-turn loop.
-        let message = hidden_tool_error_message(
-            "browser_navigate",
-            &allowlist(&["message_result", "plan", "file_read", "shell"]),
-        );
-
-        assert!(message.contains("Recovery example:"), "{message}");
-        // Should map browser_navigate → "browse" capability.
-        assert!(
-            message.contains("\"primary_capability\": \"browse\""),
-            "{message}"
-        );
-        assert!(message.contains("add_phases="), "{message}");
-        assert!(message.contains("browser_navigate"), "{message}");
-    }
-
-    #[test]
-    fn plan_update_example_maps_web_search_to_research() {
-        let example = plan_update_example_for("web_search");
-        assert!(
-            example.contains("\"primary_capability\": \"research\""),
-            "{example}"
-        );
-        assert!(example.contains("web_search"), "{example}");
-    }
-
-    #[test]
-    fn plan_update_example_maps_shell_to_engineer() {
-        let example = plan_update_example_for("shell");
-        assert!(
-            example.contains("\"primary_capability\": \"engineer\""),
-            "{example}"
-        );
-    }
-
-    #[test]
-    fn hidden_tool_error_during_final_delivery_points_to_message_tools() {
-        let message =
-            hidden_tool_error_message("shell", &allowlist(&["message_ask", "message_result"]));
-
-        assert!(message.contains("final message tools"), "{message}");
-        assert!(message.contains("message_result"), "{message}");
-        assert!(message.contains("message_ask"), "{message}");
-        assert!(!message.contains("plan(action=\"set\")"), "{message}");
-    }
-
     #[test]
     fn progress_only_tools_do_not_starve_first_work_tool() {
         let registry = registry();
@@ -1744,143 +1382,56 @@ mod tests {
         );
     }
 
-    fn registry_with_plan() -> crate::tool::ToolRegistry {
-        // Same set plus a `plan` tool so the alias redirector
-        // activates.
-        registry().with(Arc::new(LimitTool {
-            name: "plan",
-            counts: true,
-            vote_counts: true,
-            parallel_safe: false,
-        }))
-    }
-
-    fn call_with_args(name: &str, args: Value) -> ToolCall {
-        ToolCall {
-            id: format!("tc-{name}"),
-            name: name.to_string(),
-            arguments: args,
-        }
-    }
-
     #[test]
-    fn invented_plan_action_advance_is_redirected_to_plan() {
-        // Reproduces the dominant failure mode from the
-        // finance-agent-v2 trajectories: model emits
-        // `advance(evidence="…")` instead of
-        // `plan(action="advance", evidence="…")`. The redirector
-        // rewrites in place so the call reaches the plan tool.
-        let registry = registry_with_plan();
-        let mut calls = vec![call_with_args(
-            "advance",
-            json!({"evidence": "FY2024 data extracted"}),
-        )];
-
-        let n = redirect_plan_action_aliases(&mut calls, &registry);
-        assert_eq!(n, 1);
-        assert_eq!(calls[0].name, "plan");
-        assert_eq!(calls[0].arguments["action"], "advance");
-        assert_eq!(calls[0].arguments["evidence"], "FY2024 data extracted");
-    }
-
-    #[test]
-    fn invented_set_and_update_actions_also_redirect() {
-        let registry = registry_with_plan();
-        let mut calls = vec![
-            call_with_args("set", json!({"goal": "Reconstruct WSC FY2020-2024"})),
-            call_with_args("update", json!({"reason": "found a missing filing"})),
-        ];
-        let n = redirect_plan_action_aliases(&mut calls, &registry);
-        assert_eq!(n, 2);
-        assert_eq!(calls[0].name, "plan");
-        assert_eq!(calls[0].arguments["action"], "set");
-        assert_eq!(calls[1].name, "plan");
-        assert_eq!(calls[1].arguments["action"], "update");
-    }
-
-    #[test]
-    fn redirect_is_noop_when_plan_tool_not_registered() {
-        // Defensive: never invent a `plan` tool that doesn't
-        // exist. If the runtime's registry doesn't have `plan`,
-        // leave the original alias name alone so the dispatcher
-        // emits its usual "Tool 'advance' not found" error.
-        let registry = registry(); // no plan
-        let mut calls = vec![call_with_args("advance", json!({"evidence": "x"}))];
-        let n = redirect_plan_action_aliases(&mut calls, &registry);
-        assert_eq!(n, 0);
-        assert_eq!(calls[0].name, "advance");
-        assert!(calls[0].arguments.get("action").is_none());
-    }
-
-    #[test]
-    fn redirect_does_not_shadow_a_real_tool_named_advance() {
-        // If a future tool is literally registered as `advance`,
-        // the dispatcher must run that real tool, not the plan
-        // alias rewrite.
-        let registry = registry_with_plan().with(Arc::new(LimitTool {
-            name: "advance",
-            counts: true,
-            vote_counts: true,
-            parallel_safe: false,
-        }));
-        let mut calls = vec![call_with_args("advance", json!({"evidence": "x"}))];
-        let n = redirect_plan_action_aliases(&mut calls, &registry);
-        assert_eq!(n, 0);
-        assert_eq!(calls[0].name, "advance");
-    }
-
-    #[test]
-    fn redirect_preserves_explicit_action_field() {
-        // If the model already supplies `action` (perhaps mid-
-        // turn during a transition where it remembered the
-        // canonical form), don't overwrite — the existing
-        // action wins.
-        let registry = registry_with_plan();
-        let mut calls = vec![call_with_args(
-            "advance",
-            json!({"action": "update", "reason": "actually wanted to update"}),
-        )];
-        let n = redirect_plan_action_aliases(&mut calls, &registry);
-        assert_eq!(n, 1);
-        assert_eq!(calls[0].name, "plan");
-        assert_eq!(calls[0].arguments["action"], "update");
-    }
-
-    #[test]
-    fn redirect_skips_non_object_args() {
-        // The model can legally emit `arguments: Value::Null`
-        // for parameterless calls. We refuse to invent an
-        // `action` field on top of a non-object since there's
-        // nowhere to land the payload.
-        let registry = registry_with_plan();
-        let mut calls = vec![call_with_args("advance", Value::Null)];
-        let n = redirect_plan_action_aliases(&mut calls, &registry);
-        assert_eq!(n, 0);
-        assert_eq!(calls[0].name, "advance");
-    }
-
-    #[test]
-    fn unknown_tools_count_toward_the_limit() {
+    fn malformed_calls_do_not_burn_the_cap_or_preempt_real_work() {
+        // A call that resolves to no registered tool (unknown name, or an
+        // empty/blank name from a streaming glitch) does no real work — it
+        // only yields a synthetic "no such tool" error in `prepare_call`. It
+        // must NOT spend the turn's slot, or it bumps a real call into the
+        // unexecuted bin. Regression for a production case where, under
+        // `max_tool_calls_per_turn = 1`, an empty-name call preempted the
+        // model's real next call.
         let registry = registry();
+
+        // Unknown name first, real counting tool second: both run; nothing deferred.
         let (executable, unexecuted, _) = split_tool_calls_for_execution(
             vec![call("missing"), call("shell")],
             &registry,
             Some(1),
         );
+        assert_eq!(names(&executable), vec!["missing", "shell"]);
+        assert!(
+            unexecuted.is_empty(),
+            "real work must not be preempted by an unknown name: {:?}",
+            names(&unexecuted)
+        );
 
-        assert_eq!(names(&executable), vec!["missing"]);
+        // Empty name first (the prod glitch shape): the real call still runs.
+        let (executable, unexecuted, _) =
+            split_tool_calls_for_execution(vec![call(""), call("shell")], &registry, Some(1));
+        assert_eq!(names(&executable), vec!["", "shell"]);
+        assert!(
+            unexecuted.is_empty(),
+            "empty-name glitch must not preempt real work: {:?}",
+            names(&unexecuted)
+        );
+
+        // Two real counting tools: the cap still bites — the second is deferred.
+        let (executable, unexecuted, _) =
+            split_tool_calls_for_execution(vec![call("shell"), call("shell")], &registry, Some(1));
+        assert_eq!(names(&executable), vec!["shell"]);
         assert_eq!(names(&unexecuted), vec!["shell"]);
     }
 
     #[test]
     fn compute_batch_terminate_passes_when_only_advisory_siblings_dont_vote() {
-        // The Pattern C-1 fix: weak Gemini Flash models tail
-        // `message_result` with a polite `message_info` sign-off.
-        // Under the old strict-unanimous rule the trailing
-        // `message_info` (terminate=false) blocked termination and the
-        // run ground out at `max_steps_exhausted` even though the
-        // judge would have passed it. With the advisory opt-out the
-        // batch terminates on the strength of `message_result` alone.
+        // Some models tail a terminating delivery call with a polite,
+        // advisory sign-off call that opts out of the termination vote
+        // (`counts_toward_termination_vote == false`). Under a strict
+        // every-result-must-vote rule the trailing advisory call
+        // (terminate=false) would block termination and the run would
+        // grind to its iteration cap. With the advisory opt-out the
+        // batch terminates on the strength of the delivery call alone.
         let registry = registry();
         let votes = [("message_result", true), ("message_info", false)];
         assert!(compute_batch_terminate(

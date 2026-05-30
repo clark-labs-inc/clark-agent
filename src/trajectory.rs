@@ -57,6 +57,23 @@ use crate::types::{AgentMessage, RunIdentity};
 
 // ─── Records ───────────────────────────────────────────────────────
 
+/// Schema version stamped on every [`TrajectoryRecord`].
+///
+/// Bump when the record or payload shape changes in a way a consumer
+/// must branch on. Persisted records carry the version they were written
+/// with; readers can migrate or reject by inspecting [`TrajectoryRecord::schema_version`].
+/// Records written before this field existed deserialize as `0` (the
+/// serde default), so `0` means "pre-versioning".
+pub const TRAJECTORY_SCHEMA_VERSION: u32 = 1;
+
+/// Default used when deserializing a record that predates the
+/// `schema_version` field. Intentionally `0`, not the current version, so
+/// a missing field reads as "unknown / pre-versioning" rather than
+/// silently claiming to match the current schema.
+fn pre_versioning_schema() -> u32 {
+    0
+}
+
 /// One durable record emitted from a run.
 ///
 /// Each record carries a monotonic per-run `seq`, an optional
@@ -65,6 +82,11 @@ use crate::types::{AgentMessage, RunIdentity};
 /// it), and a typed [`TrajectoryPayload`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrajectoryRecord {
+    /// Schema version this record was written with. New records are
+    /// stamped with [`TRAJECTORY_SCHEMA_VERSION`]; records written before
+    /// versioning existed deserialize as `0`.
+    #[serde(default = "pre_versioning_schema")]
+    pub schema_version: u32,
     pub seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
@@ -251,6 +273,7 @@ impl TrajectoryRecorder {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let record = TrajectoryRecord {
+            schema_version: TRAJECTORY_SCHEMA_VERSION,
             seq,
             run_id: identity.as_ref().map(|i| i.run_id.clone()),
             parent_run_id: identity.as_ref().and_then(|i| i.parent_run_id.clone()),
@@ -416,7 +439,9 @@ impl crate::plugin::EventObserver for TrajectoryRecorder {
                 })
                 .await;
             }
-            AgentEvent::MessageStart { .. } | AgentEvent::MessageUpdate { .. } | AgentEvent::ToolExecutionUpdate { .. } => {
+            AgentEvent::MessageStart { .. }
+            | AgentEvent::MessageUpdate { .. }
+            | AgentEvent::ToolExecutionUpdate { .. } => {
                 // Streaming-only deltas. The streaming `EventSink` is
                 // the right channel for these; durable trajectory
                 // captures the final assembled message via
@@ -483,7 +508,47 @@ mod tests {
         for (i, r) in records.iter().enumerate() {
             assert_eq!(r.seq, i as u64);
             assert_eq!(r.run_id.as_deref(), Some(identity.run_id.as_str()));
+            assert_eq!(
+                r.schema_version, TRAJECTORY_SCHEMA_VERSION,
+                "new records carry the current schema version"
+            );
         }
+    }
+
+    #[test]
+    fn record_missing_schema_version_deserializes_as_pre_versioning() {
+        // A record persisted before the `schema_version` field existed
+        // must still deserialize, reading as `0` (pre-versioning) rather
+        // than silently claiming to match the current schema.
+        let json = serde_json::json!({
+            "seq": 7,
+            "recorded_at_unix_ms": 123,
+            "payload": { "kind": "turn_started" }
+        });
+        let record: TrajectoryRecord =
+            serde_json::from_value(json).expect("legacy record deserializes");
+        assert_eq!(record.schema_version, 0);
+        assert_eq!(record.seq, 7);
+    }
+
+    #[test]
+    fn record_round_trips_with_schema_version() {
+        let record = TrajectoryRecord {
+            schema_version: TRAJECTORY_SCHEMA_VERSION,
+            seq: 1,
+            run_id: Some("r1".into()),
+            parent_run_id: None,
+            depth: 0,
+            recorded_at_unix_ms: 1,
+            payload: TrajectoryPayload::TurnStarted,
+        };
+        let json = serde_json::to_value(&record).expect("serialize");
+        assert_eq!(
+            json["schema_version"],
+            serde_json::json!(TRAJECTORY_SCHEMA_VERSION)
+        );
+        let back: TrajectoryRecord = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.schema_version, TRAJECTORY_SCHEMA_VERSION);
     }
 
     #[tokio::test]

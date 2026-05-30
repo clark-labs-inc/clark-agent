@@ -27,8 +27,11 @@ own semantics; plugins own cross-cutting extension.
   fixture replay, scripted scenario, remote proxy.
 - **`plugin`** — `Plugin` + capability traits (`BeforeToolCall`,
   `AfterToolCall`, `ContextTransform`, `EventObserver`, `SteeringSource`,
-  `FollowUpSource`). Cross-cutting concerns register here, not inline in
-  the loop.
+  `FollowUpSource`, `ToolGate`). Cross-cutting concerns register here, not
+  inline in the loop.
+- **`protocol`** — `ProtocolPolicy`. The seam for product-specific tool
+  vocabulary (recovery prose, tool-call alias repair, hidden-tool errors,
+  terminal-tool classification). Default is generic and names no tools.
 - **`config`** — `LoopConfig` + `AgentBuilder` for assembling everything.
 - **`run`** — `run` / `run_continue` — the canonical loop. Pure functions.
 - **`exec`** — tool execution: parallel + sequential dispatch, hook plumbing.
@@ -136,14 +139,31 @@ handle.steer(AgentMessage::User {
 ## Open-source boundary
 
 `clark-agent` is the reusable loop crate: typed history, tool dispatch,
-provider transport traits, events, and extension hooks. Clark product wiring
-belongs in downstream crates such as `clark-agent-bridge`.
+provider transport traits, events, and extension hooks. Product wiring
+belongs in downstream crates.
 
-The current 0.1 line still includes a small compatibility layer for Clark's
-legacy delivery/planning tool names (`message_result`, `message_ask`, `plan`)
-so existing Clark integrations keep working while the public API stabilizes.
-New product-specific behavior should be implemented as bridge plugins or
-tool definitions rather than added to this core crate.
+The core knows **no product tool names**. The three places that once needed
+product vocabulary — plain-text recovery prose, model tool-call alias repair,
+and hidden-tool error messages — now go through a single seam, the
+[`ProtocolPolicy`] trait:
+
+```rust
+pub trait ProtocolPolicy: Send + Sync + 'static {
+    fn terminal_tool_names(&self) -> HashSet<String> { ... }
+    fn plain_text_recovery_prompt(&self, ctx: PlainTextRecoveryContext<'_>) -> Option<String> { ... }
+    fn normalize_tool_calls(&self, calls: &mut [ToolCall], registry: &ToolRegistry) -> usize { ... }
+    fn hidden_tool_error(&self, ctx: HiddenToolContext<'_>) -> Option<HiddenToolError> { ... }
+}
+```
+
+The core ships `DefaultProtocolPolicy` (generic, names no tools). A downstream
+product installs its own via `AgentBuilder::protocol_policy(...)` to inject its
+delivery/ask/plan vocabulary, tool-call aliases, and recovery prose — none of
+which lives in this crate. New product-specific behavior should be implemented
+as a `ProtocolPolicy`, a plugin (`ToolGate`, `ContextTransform`, …), or a tool
+definition rather than added to the core loop.
+
+[`ProtocolPolicy`]: https://docs.rs/clark-agent/latest/clark_agent/protocol/trait.ProtocolPolicy.html
 
 ## Release checks
 
@@ -154,6 +174,18 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo publish --dry-run
 ```
 
+## Citation
+
+Citation authorship: Stanislav Kirdey, Clark Labs Inc. See
+[`CITATION.cff`](CITATION.cff) for machine-readable citation metadata.
+
 ## License
 
-Apache-2.0.
+Apache-2.0 © Stanislav Kirdey, [Clark Labs Inc.](https://github.com/clark-labs-inc)
+
+---
+
+Built by **Stanislav Kirdey, Clark Labs Inc.** — the team behind
+[Clark](https://www.clarkchat.com), AI-powered web automation and research.
+If clark-agent is useful to you, a ⭐ on
+[GitHub](https://github.com/clark-labs-inc/clark-agent) helps others discover it.
