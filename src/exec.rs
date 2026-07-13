@@ -338,7 +338,6 @@ async fn synthesize_unexecuted_tool_results(
 ) -> Vec<AgentMessage> {
     let mut messages = Vec::with_capacity(tool_calls.len());
     for call in tool_calls {
-        emit_tool_start(config, &call).await;
         let outcome = finalize(
             assistant,
             assistant_content,
@@ -475,11 +474,11 @@ async fn execute_parallel(
     // signal.
     let batch_token = signal.child_token();
 
-    // Prep + emit start sequentially so prep ordering and event ordering
-    // are deterministic. Then await the executions concurrently.
+    // Prep + emit starts sequentially so validation and event ordering are
+    // deterministic. A start means the real tool implementation is about to
+    // run; parse, registry, validation, and before-hook failures never start.
     let mut prepared: Vec<(ToolCall, PreparedCall)> = Vec::with_capacity(tool_calls.len());
     for call in tool_calls {
-        emit_tool_start(config, &call).await;
         let prep = prepare_call(
             assistant,
             assistant_content,
@@ -489,6 +488,9 @@ async fn execute_parallel(
             turn_allowlist,
         )
         .await;
+        if matches!(prep, PreparedCall::Prepared { .. }) {
+            emit_tool_start(config, &call).await;
+        }
         prepared.push((call, prep));
     }
 
@@ -642,8 +644,6 @@ async fn run_one(
     signal: &CancellationToken,
     turn_allowlist: Option<&std::collections::HashSet<String>>,
 ) -> Result<FinalizedOutcome, LoopError> {
-    emit_tool_start(config, call).await;
-
     let prep = prepare_call(
         assistant,
         assistant_content,
@@ -667,6 +667,7 @@ async fn run_one(
             .await
         }
         PreparedCall::Prepared { tool, args } => {
+            emit_tool_start(config, call).await;
             let event_sink = config.event_sink.clone();
             let event_observers = config.plugins.event_observer.clone();
             let id = call.id.clone();

@@ -21,8 +21,9 @@ use crate::types::{
 /// Lifecycle events (`AgentStart`, `AgentEnd`, `TurnStart`, `TurnEnd`)
 /// bracket the run. Message events (`MessageStart`, `MessageUpdate`,
 /// `MessageEnd`) bracket each individual message. Tool events
-/// (`ToolExecutionStart`, `ToolExecutionUpdate`, `ToolExecutionEnd`)
-/// bracket each tool call.
+/// (`ToolExecutionStart`, `ToolExecutionUpdate`, `ToolExecutionEnd`) describe
+/// calls that reach real execution. Preflight failures emit only
+/// `ToolExecutionEnd`, carrying their typed error result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -71,7 +72,9 @@ pub enum AgentEvent {
     /// The message has been fully assembled (final content, stop reason).
     MessageEnd { message: AgentMessage },
 
-    /// A tool execution has begun.
+    /// A tool execution has begun. Emitted after registry lookup, argument
+    /// validation, and all `BeforeToolCall` gates allow the call, immediately
+    /// before the tool implementation is invoked.
     ToolExecutionStart {
         tool_call_id: String,
         tool_name: String,

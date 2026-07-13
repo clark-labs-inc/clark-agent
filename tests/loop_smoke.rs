@@ -448,9 +448,11 @@ async fn before_hook_blocks_tool_call() {
     let stream = Arc::new(ScriptedStream::new(vec![turn1, turn2]));
 
     let registry = ToolRegistry::new().with(Arc::new(EchoTool));
+    let (sink, mut rx) = ChannelSink::new();
     let config = AgentBuilder::new()
         .stream(stream)
         .tools(registry)
+        .event_sink(Arc::new(sink))
         .before_tool_call(BlockBananas)
         .max_iterations(10)
         .build()
@@ -481,6 +483,23 @@ async fn before_hook_blocks_tool_call() {
         panic!()
     };
     assert!(t.text.contains("no bananas allowed"));
+
+    drop(config);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == "c1"
+        )),
+        "a call blocked during preflight must never claim execution started"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolExecutionEnd { tool_call_id, is_error: true, .. } if tool_call_id == "c1"
+    )));
 }
 
 #[tokio::test]
