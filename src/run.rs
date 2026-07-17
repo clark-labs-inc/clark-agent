@@ -740,13 +740,15 @@ async fn stream_with_overflow_recovery(
                     estimator: &*config.token_estimator,
                 };
                 let before = std::mem::take(&mut current.messages);
-                let before_len = before.len();
+                let before_size = cx.estimator.estimate_messages(&before);
                 let after = recovery.recover(before.clone(), &cx).await;
 
-                // No-progress guard: a recovery that couldn't shrink the
-                // history would just overflow again — surface the overflow
-                // instead of retrying forever.
-                if after.len() >= before_len {
+                // No-progress guard: a recovery that didn't actually SHRINK the
+                // history (measured in estimated tokens, not message count —
+                // compaction can trade many messages for a summary + tail
+                // without reducing the count) would just overflow again.
+                // Surface the overflow instead of retrying forever.
+                if cx.estimator.estimate_messages(&after) >= before_size {
                     current.messages = before;
                     return Err(LoopError::Stream(StreamError::ContextOverflow(message)));
                 }
