@@ -279,13 +279,14 @@ async fn inner_run(
             }
 
             // Stream one assistant response, applying the configured
-            // max-tokens recovery ladder if a turn comes back
-            // truncated. `iteration` is 0-indexed and counts LLM calls
-            // within this run — `iterations` was already incremented
-            // above for cap-checking, so the 0-indexed turn number is
-            // `iterations - 1`.
+            // max-tokens recovery ladder if a turn comes back truncated,
+            // and the context-overflow recovery hook if the request is
+            // rejected for exceeding the model's window. `iteration` is
+            // 0-indexed and counts LLM calls within this run — `iterations`
+            // was already incremented above for cap-checking, so the
+            // 0-indexed turn number is `iterations - 1`.
             let (assistant, turn_allowlist) =
-                stream_with_max_tokens_recovery(current, config, signal, iterations - 1).await?;
+                stream_with_overflow_recovery(current, config, signal, iterations - 1).await?;
             // The assistant message must land in *both* the live conversation
             // (so the next turn's request body includes it — providers reject
             // tool messages that don't follow a matching assistant tool_call)
@@ -701,6 +702,72 @@ fn is_terminal_only_allowlist(
 /// retry. Persistence layers should treat the message that immediately
 /// precedes an `OutputTokensEscalation` as overridden by the next
 /// `MessageEnd`.
+/// Wraps [`stream_with_max_tokens_recovery`] with context-overflow
+/// recovery: when the provider rejects the request for exceeding its
+/// window ([`StreamError::ContextOverflow`]) and an overflow-recovery
+/// hook is installed, shrink `current.messages` in place (persisting it
+/// so later turns don't re-expand), emit the diff event, and retry the
+/// same LLM call — bounded by the hook's `max_attempts`. With no hook,
+/// or once attempts are exhausted, the overflow propagates unchanged
+/// (today's behavior). A recovery that fails to shrink also stops the
+/// loop rather than spinning.
+async fn stream_with_overflow_recovery(
+    current: &mut AgentContext,
+    config: &LoopConfig,
+    signal: &CancellationToken,
+    iteration: usize,
+) -> Result<(AgentMessage, Option<std::collections::HashSet<String>>), LoopError> {
+    let mut attempts: u8 = 0;
+    loop {
+        match stream_with_max_tokens_recovery(current, config, signal, iteration).await {
+            Err(LoopError::Stream(StreamError::ContextOverflow(message))) => {
+                let Some(recovery) = config.overflow_recovery.clone() else {
+                    return Err(LoopError::Stream(StreamError::ContextOverflow(message)));
+                };
+                if attempts >= recovery.max_attempts() || signal.is_cancelled() {
+                    return Err(LoopError::Stream(StreamError::ContextOverflow(message)));
+                }
+                attempts = attempts.saturating_add(1);
+
+                // Compute the observables before taking the history, so the
+                // borrow doesn't collide with the `mem::take` below.
+                let usage = last_provider_usage(&current.messages);
+                let cx = TransformContext {
+                    signal,
+                    model_id: config.model_id.as_deref().unwrap_or(""),
+                    iteration,
+                    last_provider_usage: usage.as_ref(),
+                    estimator: &*config.token_estimator,
+                };
+                let before = std::mem::take(&mut current.messages);
+                let before_len = before.len();
+                let after = recovery.recover(before.clone(), &cx).await;
+
+                // No-progress guard: a recovery that couldn't shrink the
+                // history would just overflow again — surface the overflow
+                // instead of retrying forever.
+                if after.len() >= before_len {
+                    current.messages = before;
+                    return Err(LoopError::Stream(StreamError::ContextOverflow(message)));
+                }
+                emit(
+                    config,
+                    AgentEvent::ContextTransformApplied {
+                        iteration,
+                        plugin: recovery.name(),
+                        before,
+                        after: after.clone(),
+                    },
+                )
+                .await;
+                current.messages = after;
+                // Retry the same LLM call against the shrunk history.
+            }
+            other => return other,
+        }
+    }
+}
+
 async fn stream_with_max_tokens_recovery(
     context: &AgentContext,
     config: &LoopConfig,
@@ -1541,6 +1608,138 @@ mod tests {
                 },
             ]))
         }
+    }
+
+    /// Overflows on the first call, then (once the history is shrunk)
+    /// returns text. Records each request so a test can assert what the
+    /// retried call actually sent.
+    #[derive(Default)]
+    struct OverflowThenTextStream {
+        calls: AtomicUsize,
+        requests: Mutex<Vec<StreamRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for OverflowThenTextStream {
+        async fn stream(
+            &self,
+            request: StreamRequest,
+            _signal: CancellationToken,
+        ) -> BoxStream<'static, StreamEvent> {
+            self.requests.lock().unwrap().push(request);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let partial = empty_assistant_message();
+            if call == 0 {
+                return Box::pin(stream::iter(vec![
+                    StreamEvent::Start {
+                        partial: partial.clone(),
+                    },
+                    StreamEvent::Error {
+                        partial,
+                        kind: StreamErrorKind::ContextOverflow,
+                        message: "maximum context length exceeded".to_string(),
+                    },
+                ]));
+            }
+            Box::pin(stream::iter(vec![
+                StreamEvent::Start { partial },
+                StreamEvent::Done {
+                    message: text_assistant_message("recovered after shrink"),
+                },
+            ]))
+        }
+    }
+
+    /// Recovery that drops every message except the last — enough to
+    /// prove the loop persists the shrink and retries.
+    struct KeepLastRecovery {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::plugin::ContextOverflowRecovery for KeepLastRecovery {
+        async fn recover(
+            &self,
+            mut messages: Vec<AgentMessage>,
+            _cx: &TransformContext<'_>,
+        ) -> Vec<AgentMessage> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(last) = messages.pop() {
+                vec![last]
+            } else {
+                messages
+            }
+        }
+        fn max_attempts(&self) -> u8 {
+            2
+        }
+        fn name(&self) -> &'static str {
+            "keep_last_recovery"
+        }
+    }
+
+    #[tokio::test]
+    async fn context_overflow_is_recovered_by_shrinking_and_retrying() {
+        let stream = Arc::new(OverflowThenTextStream::default());
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        let config = AgentBuilder::new()
+            .stream(stream.clone())
+            .model_id("test-model")
+            .overflow_recovery(KeepLastRecovery {
+                calls: recovery_calls.clone(),
+            })
+            .build()
+            .expect("config builds");
+        let mut context = AgentContext::new("system").with_messages(vec![
+            AgentMessage::User {
+                content: UserContent::Text("first".to_string()),
+                timestamp: None,
+            },
+            AgentMessage::User {
+                content: UserContent::Text("keep me".to_string()),
+                timestamp: None,
+            },
+        ]);
+
+        let (assistant, _allowlist) =
+            stream_with_overflow_recovery(&mut context, &config, &CancellationToken::new(), 0)
+                .await
+                .expect("overflow recovery should retry");
+
+        let AgentMessage::Assistant { content, .. } = assistant else {
+            panic!("expected assistant response");
+        };
+        assert_eq!(content.plain_text(), "recovered after shrink");
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 2, "one retry");
+        assert_eq!(recovery_calls.load(Ordering::SeqCst), 1);
+        // The shrink is persisted into the live transcript…
+        assert_eq!(context.messages.len(), 1);
+        // …and the retried request sent only the shrunk history.
+        let retried = &stream.requests.lock().unwrap()[1];
+        assert_eq!(retried.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn context_overflow_without_recovery_propagates() {
+        let stream = Arc::new(OverflowThenTextStream::default());
+        let config = AgentBuilder::new()
+            .stream(stream.clone())
+            .model_id("test-model")
+            .build()
+            .expect("config builds");
+        let mut context = AgentContext::new("system").with_messages(vec![AgentMessage::User {
+            content: UserContent::Text("hi".to_string()),
+            timestamp: None,
+        }]);
+
+        let result =
+            stream_with_overflow_recovery(&mut context, &config, &CancellationToken::new(), 0)
+                .await;
+        assert!(matches!(
+            result,
+            Err(LoopError::Stream(StreamError::ContextOverflow(_)))
+        ));
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 1, "no retry");
     }
 
     #[test]

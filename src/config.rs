@@ -16,8 +16,8 @@ use serde_json::Value;
 
 use crate::event::{EventSink, NoopSink};
 use crate::plugin::{
-    AfterToolCall, BeforeToolCall, ContextTransform, EventObserver, FollowUpSource, Plugin,
-    SteeringSource, ToolGate,
+    AfterToolCall, BeforeToolCall, ContextOverflowRecovery, ContextTransform, EventObserver,
+    FollowUpSource, Plugin, SteeringSource, ToolGate,
 };
 use crate::plugins::graceful_turn_limit::GracefulTurnLimit;
 use crate::protocol::{default_policy, ProtocolPolicy};
@@ -109,6 +109,14 @@ pub struct LoopConfig {
     /// behavior. Opt-in because the cost can be large (worst case
     /// 8× output tokens with `Double` × 3 attempts).
     pub max_output_tokens_recovery: Option<MaxTokensRecovery>,
+
+    /// Recovery for a provider context-window rejection mid-run. When
+    /// `Some`, a [`crate::StreamError::ContextOverflow`] triggers the
+    /// hook (typically an aggressive compaction), the shrunk history is
+    /// persisted into the live transcript, and the loop retries the same
+    /// LLM call. Default `None` — today's behavior (the overflow ends
+    /// the run). See [`crate::ContextOverflowRecovery`].
+    pub(crate) overflow_recovery: Option<Arc<dyn ContextOverflowRecovery>>,
 
     /// Hard ceiling on iterations within a single `run`. Prevents
     /// runaway loops if neither the model nor tools ever vote to
@@ -281,6 +289,7 @@ pub struct AgentBuilder {
     reasoning: ReasoningEffort,
     provider_extras: Option<Value>,
     max_output_tokens_recovery: Option<MaxTokensRecovery>,
+    overflow_recovery: Option<Arc<dyn ContextOverflowRecovery>>,
     max_iterations: Option<usize>,
     empty_outcome_retry_budget: Option<usize>,
     plain_text_terminal_fallback_tool: Option<String>,
@@ -315,6 +324,7 @@ impl AgentBuilder {
             reasoning: ReasoningEffort::default(),
             provider_extras: None,
             max_output_tokens_recovery: None,
+            overflow_recovery: None,
             max_iterations: None,
             empty_outcome_retry_budget: None,
             plain_text_terminal_fallback_tool: None,
@@ -395,6 +405,23 @@ impl AgentBuilder {
     /// `MaxTokensRecovery`. See the type for cost discussion.
     pub fn max_output_tokens_recovery(mut self, recovery: MaxTokensRecovery) -> Self {
         self.max_output_tokens_recovery = Some(recovery);
+        self
+    }
+
+    /// Enable context-overflow recovery. When a request is rejected for
+    /// exceeding the model's context window
+    /// ([`crate::StreamError::ContextOverflow`]), the loop asks `recovery`
+    /// for a smaller history, persists it, and retries the same LLM call.
+    /// Off by default. See [`ContextOverflowRecovery`] for the contract.
+    pub fn overflow_recovery<R: ContextOverflowRecovery + 'static>(mut self, recovery: R) -> Self {
+        self.overflow_recovery = Some(Arc::new(recovery));
+        self
+    }
+
+    /// [`Self::overflow_recovery`] for a pre-wrapped `Arc` (share one
+    /// recovery across multiple builders).
+    pub fn overflow_recovery_arc(mut self, recovery: Arc<dyn ContextOverflowRecovery>) -> Self {
+        self.overflow_recovery = Some(recovery);
         self
     }
 
@@ -694,6 +721,7 @@ impl AgentBuilder {
             reasoning: self.reasoning,
             provider_extras: self.provider_extras,
             max_output_tokens_recovery: self.max_output_tokens_recovery,
+            overflow_recovery: self.overflow_recovery,
             max_iterations: self.max_iterations,
             empty_outcome_retry_budget: self.empty_outcome_retry_budget,
             plain_text_terminal_fallback_tool: self.plain_text_terminal_fallback_tool,

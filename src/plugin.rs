@@ -333,6 +333,53 @@ pub trait ContextTransform: Plugin {
     ) -> Vec<AgentMessage>;
 }
 
+// ─── ContextOverflowRecovery ───────────────────────────────────────
+
+/// Recovers from a provider context-window rejection MID-RUN.
+///
+/// The token-estimate heuristics that drive `ContextTransform` are
+/// approximate, so a request can still exceed the model's real window
+/// and come back as [`crate::StreamError::ContextOverflow`]. When one is
+/// installed, the loop hands this hook the current history, the impl
+/// returns a smaller one (typically an aggressive compaction), and the
+/// loop retries the SAME LLM call — bounded by [`max_attempts`], and
+/// with the shrunk history persisted into the live transcript so later
+/// turns don't immediately re-expand.
+///
+/// Distinct from [`ContextTransform`] on purpose: this fires ONLY on an
+/// overflow (never on every round), its result is written back to the
+/// caller's transcript (not just the request clone), and returning an
+/// unshrunk history ends recovery rather than spinning.
+///
+/// [`max_attempts`]: ContextOverflowRecovery::max_attempts
+#[async_trait]
+pub trait ContextOverflowRecovery: Send + Sync {
+    /// Produce a smaller history for the retried request. `cx` carries the
+    /// same observables as a [`ContextTransform`] (cancellation signal,
+    /// model id, iteration, last provider usage, estimator). Returning a
+    /// history no shorter than the input signals "cannot shrink further"
+    /// and the loop stops retrying.
+    async fn recover(
+        &self,
+        messages: Vec<AgentMessage>,
+        cx: &TransformContext<'_>,
+    ) -> Vec<AgentMessage>;
+
+    /// Maximum recovery attempts within a single run. Default 1.
+    fn max_attempts(&self) -> u8 {
+        1
+    }
+
+    /// Label for the [`AgentEvent::ContextTransformApplied`] diff event
+    /// emitted after a successful shrink, so observers can attribute the
+    /// history change.
+    ///
+    /// [`AgentEvent::ContextTransformApplied`]: crate::AgentEvent::ContextTransformApplied
+    fn name(&self) -> &'static str {
+        "context_overflow_recovery"
+    }
+}
+
 // ─── EventObserver ─────────────────────────────────────────────────
 
 /// Pure observation hook. Logs, telemetry, replay writers. Cannot change

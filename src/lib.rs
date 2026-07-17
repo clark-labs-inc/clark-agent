@@ -65,8 +65,8 @@ pub use event::ChannelSink;
 pub use event::{AgentEvent, EventSink, ProviderRequestSummary};
 pub use plugin::PluginCapabilities;
 pub use plugin::{
-    AfterToolCall, AfterToolDecision, BeforeToolCall, BeforeToolDecision, ContextTransform,
-    EventObserver, FollowUpSource, Plugin, SteeringSource, TransformContext,
+    AfterToolCall, AfterToolDecision, BeforeToolCall, BeforeToolDecision, ContextOverflowRecovery,
+    ContextTransform, EventObserver, FollowUpSource, Plugin, SteeringSource, TransformContext,
 };
 pub use plugins::GracefulTurnLimit;
 pub use protocol::{
