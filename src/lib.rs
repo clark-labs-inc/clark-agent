@@ -41,6 +41,7 @@ pub mod config;
 pub mod error;
 pub mod event;
 pub mod exec;
+pub mod history;
 pub mod plugin;
 pub mod plugins;
 pub mod protocol;
@@ -63,6 +64,7 @@ pub use config::{
 pub use error::{LoopError, StreamError, ToolError, ToolValidationError};
 pub use event::ChannelSink;
 pub use event::{AgentEvent, EventSink, ProviderRequestSummary};
+pub use history::{normalize_tool_call_ids, ToolCallIdNormalization, UniqueToolCallIds};
 pub use plugin::PluginCapabilities;
 pub use plugin::{
     AfterToolCall, AfterToolDecision, BeforeToolCall, BeforeToolDecision, ContextOverflowRecovery,

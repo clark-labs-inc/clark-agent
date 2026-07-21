@@ -35,6 +35,8 @@ own semantics; plugins own cross-cutting extension.
 - **`config`** — `LoopConfig` + `AgentBuilder` for assembling everything.
 - **`run`** — `run` / `run_continue` — the canonical loop. Pure functions.
 - **`exec`** — tool execution: parallel + sequential dispatch, hook plumbing.
+- **`history`** — provider-facing transcript invariants, including deterministic
+  duplicate tool-call ID normalization without mutating durable storage.
 - **`budget`** — default token-budget context transform.
 - **`error`** — typed error enums.
 
@@ -52,6 +54,15 @@ own semantics; plugins own cross-cutting extension.
 A single struct can implement multiple capability traits — declare the
 set via `Plugin::capabilities()` and register once with
 `AgentBuilder::plugin()`.
+
+Durable applications should normalize provider-chosen tool-call IDs before
+wire conversion. Register `UniqueToolCallIds` as a `ContextTransform`, or use
+the pure function when an existing structural-history transform owns ordering:
+
+```rust
+let normalized = clark_agent::normalize_tool_call_ids(messages);
+let provider_messages = normalized.messages;
+```
 
 ## Quick start
 
