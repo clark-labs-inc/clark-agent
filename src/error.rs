@@ -68,6 +68,13 @@ pub enum StreamError {
     #[error("fatal stream error: {0}")]
     Fatal(String),
 
+    /// Provider request history violated the tool-call/result adjacency
+    /// contract after transport-specific projection. This is deterministic
+    /// for the assembled request and must not be retried as a transient or
+    /// collapsed into an empty model outcome.
+    #[error("inconsistent tool history: {0}")]
+    InconsistentToolHistory(String),
+
     /// Provider returned an empty response after streaming completed.
     /// The model produced nothing.
     #[error("empty stream response")]

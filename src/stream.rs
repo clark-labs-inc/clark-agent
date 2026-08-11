@@ -201,6 +201,10 @@ pub enum StreamErrorKind {
     /// a generic transient stream error.
     ZeroOutputTransport,
     Fatal,
+    /// The transport rejected the assembled request locally because an
+    /// assistant tool-call batch was missing, duplicating, or interleaving
+    /// its corresponding tool results.
+    InconsistentToolHistory,
     Empty,
     Aborted,
     /// Provider rejected the request because the assembled context

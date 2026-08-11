@@ -1085,6 +1085,9 @@ fn loop_error_from_stream_kind(kind: StreamErrorKind, message: String) -> LoopEr
             LoopError::Stream(StreamError::ZeroOutputTransport(message))
         }
         StreamErrorKind::Fatal => LoopError::Stream(StreamError::Fatal(message)),
+        StreamErrorKind::InconsistentToolHistory => {
+            LoopError::Stream(StreamError::InconsistentToolHistory(message))
+        }
         StreamErrorKind::Empty => LoopError::Stream(StreamError::Empty),
         StreamErrorKind::Aborted => LoopError::Aborted,
         StreamErrorKind::ContextOverflow => {
@@ -1299,6 +1302,20 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     };
+
+    #[test]
+    fn inconsistent_tool_history_stream_kind_stays_typed_at_loop_boundary() {
+        let error = loop_error_from_stream_kind(
+            StreamErrorKind::InconsistentToolHistory,
+            "interleaved tool result batch".into(),
+        );
+
+        assert!(matches!(
+            error,
+            LoopError::Stream(StreamError::InconsistentToolHistory(message))
+                if message == "interleaved tool result batch"
+        ));
+    }
 
     fn empty_assistant_message() -> AgentMessage {
         AgentMessage::Assistant {
