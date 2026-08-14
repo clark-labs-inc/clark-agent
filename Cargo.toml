@@ -23,7 +23,7 @@ futures = "0.3"
 schemars = { version = "0.8", features = ["derive", "preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-thiserror = "1"
+thiserror = "2"
 tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
