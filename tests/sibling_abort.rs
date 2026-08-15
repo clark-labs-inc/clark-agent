@@ -1,4 +1,4 @@
-//! Sibling-abort behavior in parallel tool batches.
+//! Sibling-abort behavior in tool batches.
 //!
 //! Proves three things:
 //!
@@ -14,8 +14,8 @@
 use async_trait::async_trait;
 use clark_agent::{
     AgentBuilder, AgentContext, AgentMessage, AgentTool, AssistantBlock, AssistantContent,
-    StopReason, StreamEvent, StreamFn, StreamRequest, ToolCall, ToolError, ToolRegistry,
-    ToolResult, ToolUpdateSink, UserContent,
+    ExecutionMode, StopReason, StreamEvent, StreamFn, StreamRequest, ToolCall, ToolError,
+    ToolRegistry, ToolResult, ToolUpdateSink, UserContent,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{json, Value};
@@ -26,6 +26,35 @@ use tokio_util::sync::CancellationToken;
 
 struct ScriptedStream {
     queue: Mutex<Vec<AgentMessage>>,
+}
+
+/// Records whether it was ever started. Used to prove that sequential sibling
+/// abort leaves dependent work untouched rather than cancelling it mid-flight.
+struct RecordedSibling {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl AgentTool for RecordedSibling {
+    fn name(&self) -> &str {
+        "recorded"
+    }
+    fn description(&self) -> &str {
+        "records execution"
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    async fn execute(
+        &self,
+        _id: &str,
+        _args: Value,
+        _signal: CancellationToken,
+        _update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolResult::text("recorded"))
+    }
 }
 
 #[async_trait]
@@ -73,6 +102,35 @@ impl AgentTool for FailingTool {
         _update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         Ok(ToolResult::error("simulated failure"))
+    }
+}
+
+/// Succeeds while retaining the opt-in marker, proving the marker only affects
+/// batches after an actual failure.
+struct SuccessfulGate;
+
+#[async_trait]
+impl AgentTool for SuccessfulGate {
+    fn name(&self) -> &str {
+        "successful"
+    }
+    fn description(&self) -> &str {
+        "always succeeds"
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn aborts_siblings_on_error(&self) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        _id: &str,
+        _args: Value,
+        _signal: CancellationToken,
+        _update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::text("ok"))
     }
 }
 
@@ -287,6 +345,100 @@ async fn opt_out_failures_do_not_abort_siblings() {
     assert!(
         completed_naturally.load(Ordering::SeqCst),
         "slow tool should have completed normally"
+    );
+}
+
+#[tokio::test]
+async fn sequential_batch_does_not_start_later_siblings_after_opt_in_failure() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FailingTool {
+        aborts_siblings: true,
+    }));
+    registry.register(Arc::new(RecordedSibling {
+        calls: calls.clone(),
+    }));
+
+    let stream = ScriptedStream {
+        queue: Mutex::new(vec![two_call_turn("failing", "recorded"), natural_end()]),
+    };
+    let config = AgentBuilder::new()
+        .stream(Arc::new(stream))
+        .tools(registry)
+        .default_execution_mode(ExecutionMode::Sequential)
+        .max_iterations(5)
+        .build()
+        .expect("builder");
+
+    let context = AgentContext::new("system");
+    let prompt = AgentMessage::User {
+        content: UserContent::Text("go".into()),
+        timestamp: None,
+    };
+    let result = clark_agent::run(vec![prompt], context, &config, CancellationToken::new())
+        .await
+        .expect("run");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the dependent sibling must never start"
+    );
+    let recorded_result = result.messages.iter().find_map(|message| match message {
+        AgentMessage::ToolResult {
+            tool_name,
+            content,
+            is_error,
+            details,
+            ..
+        } if tool_name == "recorded" => Some((content.plain_text(), *is_error, details)),
+        _ => None,
+    });
+    let (text, is_error, details) = recorded_result.expect("recorded tool result");
+    assert!(is_error, "skipped sibling must be a recoverable error");
+    assert!(text.contains("earlier sibling tool `failing` failed"));
+    assert_eq!(
+        details
+            .as_ref()
+            .and_then(|value| value.get("reason"))
+            .and_then(Value::as_str),
+        Some("sibling_tool_error")
+    );
+}
+
+#[tokio::test]
+async fn sequential_batch_runs_later_siblings_after_opt_in_success() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(SuccessfulGate));
+    registry.register(Arc::new(RecordedSibling {
+        calls: calls.clone(),
+    }));
+
+    let stream = ScriptedStream {
+        queue: Mutex::new(vec![two_call_turn("successful", "recorded"), natural_end()]),
+    };
+    let config = AgentBuilder::new()
+        .stream(Arc::new(stream))
+        .tools(registry)
+        .default_execution_mode(ExecutionMode::Sequential)
+        .max_iterations(5)
+        .build()
+        .expect("builder");
+
+    let context = AgentContext::new("system");
+    let prompt = AgentMessage::User {
+        content: UserContent::Text("go".into()),
+        timestamp: None,
+    };
+    let _ = clark_agent::run(vec![prompt], context, &config, CancellationToken::new())
+        .await
+        .expect("run");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a successful prerequisite must preserve later batched work"
     );
 }
 

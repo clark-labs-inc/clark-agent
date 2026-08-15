@@ -6,9 +6,9 @@ use clark_agent::stream::StreamErrorKind;
 use clark_agent::{
     AfterToolCall, AfterToolDecision, AgentBuilder, AgentContext, AgentEvent, AgentMessage,
     AgentTool, AssistantBlock, AssistantContent, BeforeToolCall, BeforeToolDecision, ChannelSink,
-    EventObserver, LoopError, Plugin, PluginCapabilities, StopReason, StreamError, StreamEvent,
-    StreamFn, StreamRequest, ToolCall, ToolError, ToolRegistry, ToolResult, ToolResultBlock,
-    ToolUpdateSink, UserContent,
+    EventObserver, LoopError, Plugin, PluginCapabilities, StopReason, StreamEvent, StreamFn,
+    StreamRequest, ToolCall, ToolError, ToolRegistry, ToolResult, ToolResultBlock, ToolUpdateSink,
+    UserContent,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::Value;
@@ -735,8 +735,8 @@ async fn execution_tool_error_remains_context_event() {
     assert!(t.text.contains("recoverable execution failure"));
 }
 
-#[tokio::test]
-async fn transient_stream_error_propagates_out_of_loop() {
+#[tokio::test(start_paused = true)]
+async fn transient_stream_error_retries_until_cancelled() {
     let stream = Arc::new(EventScriptedStream::new(vec![StreamEvent::Error {
         partial: empty_assistant(StopReason::Other, None),
         kind: StreamErrorKind::Transient,
@@ -748,6 +748,13 @@ async fn transient_stream_error_propagates_out_of_loop() {
         .build()
         .unwrap();
 
+    let signal = CancellationToken::new();
+    let cancel = signal.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        cancel.cancel();
+    });
+
     let err = clark_agent::run(
         vec![AgentMessage::User {
             content: UserContent::Text("go".into()),
@@ -755,15 +762,12 @@ async fn transient_stream_error_propagates_out_of_loop() {
         }],
         AgentContext::new("test"),
         &config,
-        CancellationToken::new(),
+        signal,
     )
     .await
-    .expect_err("transient stream errors should abort the run");
+    .expect_err("cancellation should stop transient retries");
 
-    assert!(matches!(
-        err,
-        LoopError::Stream(StreamError::Transient(message)) if message == "rate limited"
-    ));
+    assert!(matches!(err, LoopError::Aborted));
 }
 
 #[tokio::test]
@@ -823,8 +827,8 @@ async fn aborted_stream_error_emits_aborted_message_end() {
     assert_eq!(error_message.as_deref(), Some("aborted before send"));
 }
 
-#[tokio::test]
-async fn empty_stream_error_propagates_out_of_loop() {
+#[tokio::test(start_paused = true)]
+async fn empty_stream_retries_until_cancelled() {
     let stream = Arc::new(EventScriptedStream::new(Vec::new()));
     let config = AgentBuilder::new()
         .stream(stream)
@@ -832,6 +836,13 @@ async fn empty_stream_error_propagates_out_of_loop() {
         .build()
         .unwrap();
 
+    let signal = CancellationToken::new();
+    let cancel = signal.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        cancel.cancel();
+    });
+
     let err = clark_agent::run(
         vec![AgentMessage::User {
             content: UserContent::Text("go".into()),
@@ -839,27 +850,33 @@ async fn empty_stream_error_propagates_out_of_loop() {
         }],
         AgentContext::new("test"),
         &config,
-        CancellationToken::new(),
+        signal,
     )
     .await
-    .expect_err("stream without a terminal event should abort the run");
+    .expect_err("cancellation should stop empty-stream retries");
 
-    assert!(matches!(err, LoopError::Stream(StreamError::Empty)));
+    assert!(matches!(err, LoopError::Aborted));
 }
 
-#[tokio::test]
-async fn assistant_error_stop_reason_propagates_out_of_loop() {
-    let stream = Arc::new(ScriptedStream::new(vec![empty_assistant(
-        StopReason::Error,
-        Some("provider stopped with error"),
-    )]));
+#[tokio::test(start_paused = true)]
+async fn assistant_error_stop_reason_is_retried() {
+    let stream = Arc::new(ScriptedStream::new(vec![
+        empty_assistant(StopReason::Error, Some("provider stopped with error")),
+        AgentMessage::Assistant {
+            content: AssistantContent::text("recovered"),
+            stop_reason: StopReason::EndTurn,
+            error_message: None,
+            timestamp: None,
+            usage: None,
+        },
+    ]));
     let config = AgentBuilder::new()
         .stream(stream)
         .max_iterations(10)
         .build()
         .unwrap();
 
-    let err = clark_agent::run(
+    let result = clark_agent::run(
         vec![AgentMessage::User {
             content: UserContent::Text("go".into()),
             timestamp: None,
@@ -869,13 +886,12 @@ async fn assistant_error_stop_reason_propagates_out_of_loop() {
         CancellationToken::new(),
     )
     .await
-    .expect_err("assistant error stop reason should abort the run");
+    .expect("transient assistant errors should retry");
 
-    assert!(matches!(
-        err,
-        LoopError::Stream(StreamError::Transient(message))
-            if message == "provider stopped with error"
-    ));
+    let AgentMessage::Assistant { content, .. } = result.messages.last().unwrap() else {
+        panic!("expected recovered assistant response");
+    };
+    assert_eq!(content.plain_text(), "recovered");
 }
 
 #[tokio::test]

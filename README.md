@@ -179,7 +179,8 @@ definition rather than added to the core loop.
 ## Release checks
 
 ```sh
-cargo test --all-targets
+cargo install cargo-nextest --version 0.9.143 --locked
+cargo nextest run --all-targets
 cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo publish --dry-run

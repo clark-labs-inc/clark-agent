@@ -35,11 +35,10 @@ use crate::types::{
     AgentContext, AgentMessage, AssistantContent, StopReason, ToolResultContent, Usage,
 };
 
-const EMPTY_STREAM_MAX_ATTEMPTS: u8 = 3;
 const EMPTY_STREAM_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
-const ZERO_OUTPUT_TRANSPORT_MAX_ATTEMPTS: u8 = 2;
 const ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY: std::time::Duration =
     std::time::Duration::from_millis(500);
+const PROVIDER_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 const ZERO_OUTPUT_TRANSPORT_RECOVERY_CONTEXT: &str = "\
 [runtime context — transport recovery, not user instruction]\n\
 The previous provider attempt produced no actionable output: no visible assistant text and no usable tool call reached the runtime. \
@@ -293,49 +292,6 @@ async fn inner_run(
             // and the run's emitted-messages tail.
             current.messages.push(assistant.clone());
             new_messages.push(assistant.clone());
-
-            // Stop on stream-level error/abort. Well-behaved
-            // transports surface these as `StreamEvent::Error`, which
-            // `stream_assistant_response` converts to `LoopError`
-            // before returning. Keep this branch as a guard for
-            // transports that incorrectly finalize a `Done` message
-            // with an error stop reason.
-            let stop_reason = match &assistant {
-                AgentMessage::Assistant { stop_reason, .. } => *stop_reason,
-                _ => StopReason::Other,
-            };
-            if matches!(stop_reason, StopReason::Error | StopReason::Aborted) {
-                let loop_error = match &assistant {
-                    AgentMessage::Assistant {
-                        stop_reason: StopReason::Aborted,
-                        ..
-                    } => LoopError::Aborted,
-                    AgentMessage::Assistant { error_message, .. } => LoopError::Stream(
-                        StreamError::Transient(error_message.clone().unwrap_or_else(|| {
-                            "assistant stream ended with error stop reason".into()
-                        })),
-                    ),
-                    _ => LoopError::Stream(StreamError::Transient(
-                        "assistant stream ended with error stop reason".into(),
-                    )),
-                };
-                emit(
-                    config,
-                    AgentEvent::TurnEnd {
-                        message: assistant,
-                        tool_results: Vec::new(),
-                    },
-                )
-                .await;
-                emit(
-                    config,
-                    AgentEvent::AgentEnd {
-                        messages: new_messages.clone(),
-                    },
-                )
-                .await;
-                return Err(loop_error);
-            }
 
             // Extract tool calls.
             let tool_calls: Vec<_> = match &assistant {
@@ -707,27 +663,23 @@ fn is_terminal_only_allowlist(
 /// window ([`StreamError::ContextOverflow`]) and an overflow-recovery
 /// hook is installed, shrink `current.messages` in place (persisting it
 /// so later turns don't re-expand), emit the diff event, and retry the
-/// same LLM call — bounded by the hook's `max_attempts`. With no hook,
-/// or once attempts are exhausted, the overflow propagates unchanged
-/// (today's behavior). A recovery that fails to shrink also stops the
-/// loop rather than spinning.
+/// same LLM call. With no hook, the overflow propagates unchanged. A
+/// recovery that fails to shrink also stops the loop rather than spinning.
 async fn stream_with_overflow_recovery(
     current: &mut AgentContext,
     config: &LoopConfig,
     signal: &CancellationToken,
     iteration: usize,
 ) -> Result<(AgentMessage, Option<std::collections::HashSet<String>>), LoopError> {
-    let mut attempts: u8 = 0;
     loop {
         match stream_with_max_tokens_recovery(current, config, signal, iteration).await {
             Err(LoopError::Stream(StreamError::ContextOverflow(message))) => {
                 let Some(recovery) = config.overflow_recovery.clone() else {
                     return Err(LoopError::Stream(StreamError::ContextOverflow(message)));
                 };
-                if attempts >= recovery.max_attempts() || signal.is_cancelled() {
+                if signal.is_cancelled() {
                     return Err(LoopError::Stream(StreamError::ContextOverflow(message)));
                 }
-                attempts = attempts.saturating_add(1);
 
                 // Compute the observables before taking the history, so the
                 // borrow doesn't collide with the `mem::take` below.
@@ -778,8 +730,9 @@ async fn stream_with_max_tokens_recovery(
 ) -> Result<(AgentMessage, Option<std::collections::HashSet<String>>), LoopError> {
     let mut current_cap = config.max_output_tokens;
     let mut max_tokens_attempt: u8 = 0;
-    let mut empty_stream_attempts: u8 = 0;
-    let mut zero_output_transport_attempts: u8 = 0;
+    let mut empty_stream_attempts: u32 = 0;
+    let mut zero_output_transport_attempts: u32 = 0;
+    let mut transient_stream_attempts: u32 = 0;
     let mut zero_output_recovery_context: Option<AgentContext> = None;
     let mut reasoning = config.reasoning;
 
@@ -796,26 +749,39 @@ async fn stream_with_max_tokens_recovery(
         .await
         {
             Ok(pair) => pair,
-            Err(LoopError::Stream(StreamError::Empty))
-                if empty_stream_attempts + 1 < EMPTY_STREAM_MAX_ATTEMPTS =>
-            {
+            Err(LoopError::Stream(StreamError::Empty)) => {
                 empty_stream_attempts = empty_stream_attempts.saturating_add(1);
-                let delay = EMPTY_STREAM_RETRY_INITIAL_DELAY * u32::from(empty_stream_attempts);
+                let delay =
+                    provider_retry_delay(EMPTY_STREAM_RETRY_INITIAL_DELAY, empty_stream_attempts);
                 tokio::select! {
                     _ = signal.cancelled() => return Err(LoopError::Aborted),
                     _ = tokio::time::sleep(delay) => {}
                 }
                 continue;
             }
-            Err(LoopError::Stream(StreamError::ZeroOutputTransport(_)))
-                if zero_output_transport_attempts + 1 < ZERO_OUTPUT_TRANSPORT_MAX_ATTEMPTS =>
-            {
+            Err(LoopError::Stream(StreamError::ZeroOutputTransport(_))) => {
                 zero_output_transport_attempts = zero_output_transport_attempts.saturating_add(1);
                 zero_output_recovery_context =
                     Some(context_with_zero_output_transport_recovery(context));
                 reasoning = zero_output_transport_retry_reasoning(config.reasoning);
-                let delay = ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY
-                    * u32::from(zero_output_transport_attempts);
+                let delay = provider_retry_delay(
+                    ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
+                    zero_output_transport_attempts,
+                );
+                tokio::select! {
+                    _ = signal.cancelled() => return Err(LoopError::Aborted),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                continue;
+            }
+            Err(LoopError::Stream(
+                StreamError::Transient(_) | StreamError::ProviderRateLimited(_),
+            )) => {
+                transient_stream_attempts = transient_stream_attempts.saturating_add(1);
+                let delay = provider_retry_delay(
+                    ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
+                    transient_stream_attempts,
+                );
                 tokio::select! {
                     _ = signal.cancelled() => return Err(LoopError::Aborted),
                     _ = tokio::time::sleep(delay) => {}
@@ -829,6 +795,21 @@ async fn stream_with_max_tokens_recovery(
             AgentMessage::Assistant { stop_reason, .. } => *stop_reason,
             _ => StopReason::Other,
         };
+        if stop_reason == StopReason::Aborted {
+            return Err(LoopError::Aborted);
+        }
+        if stop_reason == StopReason::Error {
+            transient_stream_attempts = transient_stream_attempts.saturating_add(1);
+            let delay = provider_retry_delay(
+                ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
+                transient_stream_attempts,
+            );
+            tokio::select! {
+                _ = signal.cancelled() => return Err(LoopError::Aborted),
+                _ = tokio::time::sleep(delay) => {}
+            }
+            continue;
+        }
         if stop_reason != StopReason::MaxTokens {
             return Ok((assistant, allowlist));
         }
@@ -866,6 +847,11 @@ async fn stream_with_max_tokens_recovery(
         // OutputTokensEscalation event above is the listener's signal
         // to roll the previous pair back from any projection.
     }
+}
+
+fn provider_retry_delay(base: std::time::Duration, attempt: u32) -> std::time::Duration {
+    base.saturating_mul(attempt.min(64))
+        .min(PROVIDER_RETRY_MAX_DELAY)
 }
 
 async fn stream_assistant_response(
@@ -1354,9 +1340,18 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct EmptyThenTextStream {
         calls: AtomicUsize,
+        failures_before_success: usize,
+    }
+
+    impl EmptyThenTextStream {
+        fn new(failures_before_success: usize) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                failures_before_success,
+            }
+        }
     }
 
     #[derive(Default)]
@@ -1537,7 +1532,7 @@ mod tests {
         ) -> BoxStream<'static, StreamEvent> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let partial = empty_assistant_message();
-            if call == 0 {
+            if call < self.failures_before_success {
                 return Box::pin(stream::iter(vec![
                     StreamEvent::Start {
                         partial: partial.clone(),
@@ -1632,10 +1627,26 @@ mod tests {
     /// Overflows on the first call, then (once the history is shrunk)
     /// returns text. Records each request so a test can assert what the
     /// retried call actually sent.
-    #[derive(Default)]
     struct OverflowThenTextStream {
         calls: AtomicUsize,
         requests: Mutex<Vec<StreamRequest>>,
+        overflows_before_success: usize,
+    }
+
+    impl OverflowThenTextStream {
+        fn new(overflows_before_success: usize) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                requests: Mutex::new(Vec::new()),
+                overflows_before_success,
+            }
+        }
+    }
+
+    impl Default for OverflowThenTextStream {
+        fn default() -> Self {
+            Self::new(1)
+        }
     }
 
     #[async_trait::async_trait]
@@ -1648,7 +1659,7 @@ mod tests {
             self.requests.lock().unwrap().push(request);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let partial = empty_assistant_message();
-            if call == 0 {
+            if call < self.overflows_before_success {
                 return Box::pin(stream::iter(vec![
                     StreamEvent::Start {
                         partial: partial.clone(),
@@ -1669,8 +1680,8 @@ mod tests {
         }
     }
 
-    /// Recovery that drops every message except the last — enough to
-    /// prove the loop persists the shrink and retries.
+    /// Recovery that drops the oldest message — enough to prove the loop
+    /// persists each material shrink and can retry repeatedly.
     struct KeepLastRecovery {
         calls: Arc<AtomicUsize>,
     }
@@ -1683,14 +1694,10 @@ mod tests {
             _cx: &TransformContext<'_>,
         ) -> Vec<AgentMessage> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(last) = messages.pop() {
-                vec![last]
-            } else {
-                messages
+            if !messages.is_empty() {
+                messages.remove(0);
             }
-        }
-        fn max_attempts(&self) -> u8 {
-            2
+            messages
         }
         fn name(&self) -> &'static str {
             "keep_last_recovery"
@@ -1739,6 +1746,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_overflow_recovery_outlives_the_legacy_two_attempt_cap() {
+        let stream = Arc::new(OverflowThenTextStream::new(3));
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        let config = AgentBuilder::new()
+            .stream(stream.clone())
+            .model_id("test-model")
+            .overflow_recovery(KeepLastRecovery {
+                calls: recovery_calls.clone(),
+            })
+            .build()
+            .expect("config builds");
+        let mut context = AgentContext::new("system").with_messages(
+            ["first", "second", "third", "keep me"]
+                .into_iter()
+                .map(|text| AgentMessage::User {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: None,
+                })
+                .collect(),
+        );
+
+        let (assistant, _allowlist) =
+            stream_with_overflow_recovery(&mut context, &config, &CancellationToken::new(), 0)
+                .await
+                .expect("fourth stream attempt should recover");
+
+        let AgentMessage::Assistant { content, .. } = assistant else {
+            panic!("expected assistant response");
+        };
+        assert_eq!(content.plain_text(), "recovered after shrink");
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(recovery_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(context.messages.len(), 1);
+    }
+
+    #[tokio::test]
     async fn context_overflow_without_recovery_propagates() {
         let stream = Arc::new(OverflowThenTextStream::default());
         let config = AgentBuilder::new()
@@ -1768,9 +1811,9 @@ mod tests {
         assert!(!LoopOutcome::HitMaxIterations.is_complete());
     }
 
-    #[tokio::test]
-    async fn empty_stream_response_is_retried_before_returning() {
-        let stream = Arc::new(EmptyThenTextStream::default());
+    #[tokio::test(start_paused = true)]
+    async fn empty_stream_recovery_outlives_the_legacy_three_attempt_cap() {
+        let stream = Arc::new(EmptyThenTextStream::new(4));
         let config = AgentBuilder::new()
             .stream(stream.clone())
             .model_id("test-model")
@@ -1784,13 +1827,13 @@ mod tests {
         let (assistant, _allowlist) =
             stream_with_max_tokens_recovery(&context, &config, &CancellationToken::new(), 0)
                 .await
-                .expect("second stream attempt should recover");
+                .expect("fifth stream attempt should recover");
 
         let AgentMessage::Assistant { content, .. } = assistant else {
             panic!("expected assistant response");
         };
         assert_eq!(content.plain_text(), "recovered");
-        assert_eq!(stream.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]

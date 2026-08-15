@@ -144,6 +144,23 @@ impl ToolResult {
         }
     }
 
+    /// A recoverable rejection at the typed tool-argument boundary.
+    ///
+    /// The text remains part of model-visible history so the model can
+    /// repair its next call. The structured details let observers and
+    /// guardrails distinguish that expected correction from an operational
+    /// tool failure without parsing provider- or serde-authored prose.
+    pub fn argument_validation_error(tool: &str, text: impl Into<String>) -> Self {
+        let mut result = Self::error(text);
+        result.details = serde_json::json!({
+            "kind": "tool_argument_validation",
+            "recoverable": true,
+            "display_hidden": true,
+            "tool": tool,
+        });
+        result
+    }
+
     /// Attach a one-sentence diary entry in the user's voice. Whitespace-only
     /// input is dropped to keep the diary clean. Trims surrounding whitespace
     /// so call sites can hand in templated multi-line strings.
@@ -292,12 +309,12 @@ pub trait AgentTool: Send + Sync + 'static {
         crate::tool_identity::ToolIdentityPolicy::default()
     }
 
-    /// Whether a non-fatal failure of this tool in a parallel batch
-    /// should cancel its still-running sibling tools. Default `false`
-    /// — failures are isolated and siblings run to completion. Tools
-    /// where one failure makes parallel work meaningless (a `shell`
-    /// step that gates `npm test`, a delegated build whose result the
-    /// siblings depend on) opt in by overriding this to `true`.
+    /// Whether a non-fatal failure of this tool in a batch should stop
+    /// dependent sibling work. Default `false` — failures are isolated
+    /// and siblings run to completion. Tools where one failure makes
+    /// sibling work meaningless (a prerequisite state update that gates
+    /// later work, a shell step that gates `npm test`) opt in by
+    /// overriding this to `true`.
     ///
     /// Cancelled siblings produce a `ToolResult` with
     /// `is_error: true, content: "aborted because sibling 'X' failed"`
@@ -305,10 +322,10 @@ pub trait AgentTool: Send + Sync + 'static {
     /// `LoopError`s. Sibling-abort therefore never ends the run on its
     /// own; the unanimous-vote termination rule is preserved.
     ///
-    /// Cancellation is cooperative: tools must check
+    /// In parallel mode, cancellation is cooperative: tools must check
     /// `signal.is_cancelled()` (or wrap blocking work in `select!`) to
-    /// honor the cancel promptly. Subprocess-based tools should rely
-    /// on `Drop` killing the child when the future is dropped.
+    /// honor the cancel promptly. In sequential mode, later siblings
+    /// never start and receive typed not-executed results instead.
     fn aborts_siblings_on_error(&self) -> bool {
         false
     }
@@ -441,8 +458,8 @@ pub trait TypedAgentTool: Send + Sync + 'static {
         crate::tool_identity::ToolIdentityPolicy::default()
     }
 
-    /// Whether a non-fatal failure of this tool in a parallel batch
-    /// cancels still-running siblings. Default false.
+    /// Whether a non-fatal failure of this tool in a batch stops
+    /// dependent siblings. Default false.
     fn aborts_siblings_on_error(&self) -> bool {
         false
     }
@@ -592,11 +609,15 @@ impl<T: TypedAgentTool> AgentTool for T {
         let parsed: T::Args = match serde_json::from_value(coerced) {
             Ok(v) => v,
             Err(e) => {
-                return Ok(ToolResult::error(format!(
-                    "{}: invalid arguments: {}",
-                    TypedAgentTool::name(self),
-                    enrich_arg_parse_error_message(&e),
-                )));
+                let tool_name = TypedAgentTool::name(self);
+                return Ok(ToolResult::argument_validation_error(
+                    tool_name,
+                    format!(
+                        "{}: invalid arguments: {}",
+                        tool_name,
+                        enrich_arg_parse_error_message(&e),
+                    ),
+                ));
             }
         };
         TypedAgentTool::run(self, call_id, parsed, signal, update).await
@@ -1873,6 +1894,15 @@ mod tests {
         .await
         .unwrap();
         assert!(result.is_error, "expected validator rejection");
+        assert_eq!(
+            result.details,
+            serde_json::json!({
+                "kind": "tool_argument_validation",
+                "recoverable": true,
+                "display_hidden": true,
+                "tool": "coercible",
+            })
+        );
         let ToolResultBlock::Text(t) = &result.content[0] else {
             panic!("expected text result");
         };

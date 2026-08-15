@@ -429,7 +429,8 @@ async fn execute_sequential(
     let mut messages = Vec::with_capacity(tool_calls.len());
     let mut votes: Vec<(String, bool)> = Vec::with_capacity(tool_calls.len());
 
-    for call in tool_calls {
+    let mut remaining_calls = tool_calls.into_iter();
+    while let Some(call) = remaining_calls.next() {
         let outcome = run_one(
             assistant,
             assistant_content,
@@ -440,8 +441,31 @@ async fn execute_sequential(
             turn_allowlist,
         )
         .await?;
+        let abort_remaining = outcome.is_error
+            && config
+                .tools
+                .get(&call.name)
+                .map(|tool| tool.aborts_siblings_on_error())
+                .unwrap_or(false);
         votes.push((call.name.clone(), outcome.terminate));
         messages.push(outcome_to_message(&call, outcome));
+
+        if abort_remaining {
+            let skipped_calls: Vec<_> = remaining_calls.collect();
+            votes.extend(skipped_calls.iter().map(|call| (call.name.clone(), false)));
+            messages.extend(
+                synthesize_aborted_sibling_tool_results(
+                    assistant,
+                    assistant_content,
+                    skipped_calls,
+                    &call.name,
+                    context,
+                    config,
+                )
+                .await,
+            );
+            break;
+        }
     }
 
     let terminate =
@@ -451,6 +475,49 @@ async fn execute_sequential(
         messages,
         terminate,
     })
+}
+
+/// Synthesize recoverable results for sequential siblings that never started
+/// because an earlier tool explicitly declared its failure to be a dependency
+/// boundary for the rest of the batch.
+#[allow(clippy::too_many_arguments)]
+async fn synthesize_aborted_sibling_tool_results(
+    assistant: &AgentMessage,
+    assistant_content: &AssistantContent,
+    tool_calls: Vec<ToolCall>,
+    failed_tool_name: &str,
+    context: &AgentContext,
+    config: &LoopConfig,
+) -> Vec<AgentMessage> {
+    let mut messages = Vec::with_capacity(tool_calls.len());
+    for call in tool_calls {
+        let mut result = ToolResult::error(format!(
+            "This tool call was not executed because earlier sibling tool \
+             `{failed_tool_name}` failed and declared later work dependent on \
+             its success. Correct that error, then reissue this call in a later turn."
+        ));
+        result.details = json!({
+            "kind": "tool_call_not_executed",
+            "reason": "sibling_tool_error",
+            "failed_tool": failed_tool_name,
+        });
+        let outcome = finalize(
+            assistant,
+            assistant_content,
+            &call,
+            &call.arguments,
+            ExecutedOutcome {
+                result,
+                is_error: true,
+            },
+            &context.messages,
+            &config.plugins.after_tool_call,
+        )
+        .await;
+        emit_tool_end(config, &call, &outcome).await;
+        messages.push(outcome_to_message(&call, outcome));
+    }
+    messages
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -844,7 +911,10 @@ async fn prepare_call(
     // before validation/dispatch.
     if let Some((parse_err, raw)) = detect_arg_parse_error(&call.arguments) {
         return PreparedCall::Immediate(ExecutedOutcome {
-            result: ToolResult::error(format_arg_parse_error(&call.name, parse_err, raw)),
+            result: ToolResult::argument_validation_error(
+                &call.name,
+                format_arg_parse_error(&call.name, parse_err, raw),
+            ),
             is_error: true,
         });
     }
@@ -853,7 +923,7 @@ async fn prepare_call(
 
     if let Err(err) = tool.validate(&prepared_args) {
         return PreparedCall::Immediate(ExecutedOutcome {
-            result: ToolResult::error(err.to_string()),
+            result: ToolResult::argument_validation_error(&call.name, err.to_string()),
             is_error: true,
         });
     }
