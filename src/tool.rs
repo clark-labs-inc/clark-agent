@@ -600,7 +600,7 @@ impl<T: TypedAgentTool> AgentTool for T {
         // to their declared types BEFORE serde validation runs. Some
         // providers (notably the "auto-when-forced" class) emit
         // tool-call arguments where every value is a JSON string —
-        // `{"max_iterations": "50"}` instead of `{"max_iterations": 50}`.
+        // `{"item_count": "50"}` instead of `{"item_count": 50}`.
         // The strict serde path rejects every such call, wasting a turn
         // per field; coercion converts the obvious case in-place using
         // the tool's own schema as the source of truth.
@@ -1433,7 +1433,7 @@ mod tests {
     //
     // Some providers (notably the "auto-when-forced" class) emit tool
     // arguments as JSON strings for fields the schema declares as
-    // integers, booleans, or numbers — e.g. `max_iterations: "50"`,
+    // integers, booleans, or numbers — e.g. `item_count: "50"`,
     // `num_results: "10"`, `full_page: "True"`, `full_page: "true"` —
     // each a wasted turn under strict serde. The coercion helpers
     // normalize the dominant cases against the tool's own JSON Schema;
@@ -1449,13 +1449,11 @@ mod tests {
     #[test]
     fn coerce_string_to_integer_when_schema_says_integer() {
         let schema = make_schema(serde_json::json!({
-            "max_iterations": {"type": "integer"},
+            "item_count": {"type": "integer"},
         }));
-        let coerced = coerce_string_scalars_at_top_level(
-            serde_json::json!({"max_iterations": "50"}),
-            &schema,
-        );
-        assert_eq!(coerced, serde_json::json!({"max_iterations": 50}));
+        let coerced =
+            coerce_string_scalars_at_top_level(serde_json::json!({"item_count": "50"}), &schema);
+        assert_eq!(coerced, serde_json::json!({"item_count": 50}));
     }
 
     #[test]
@@ -1527,16 +1525,14 @@ mod tests {
     #[test]
     fn coerce_leaves_unparseable_strings_alone() {
         let schema = make_schema(serde_json::json!({
-            "max_iterations": {"type": "integer"},
+            "item_count": {"type": "integer"},
         }));
-        let coerced = coerce_string_scalars_at_top_level(
-            serde_json::json!({"max_iterations": "fifty"}),
-            &schema,
-        );
+        let coerced =
+            coerce_string_scalars_at_top_level(serde_json::json!({"item_count": "fifty"}), &schema);
         // Unparseable values pass through so the strict serde path
         // produces the canonical "invalid type" error rather than us
         // silently dropping the value.
-        assert_eq!(coerced, serde_json::json!({"max_iterations": "fifty"}));
+        assert_eq!(coerced, serde_json::json!({"item_count": "fifty"}));
     }
 
     #[test]
@@ -1544,13 +1540,11 @@ mod tests {
         // `Option<usize>` renders as `{"type": ["integer", "null"]}`.
         // The non-null branch is unambiguous, so coercion still applies.
         let schema = make_schema(serde_json::json!({
-            "max_iterations": {"type": ["integer", "null"]},
+            "item_count": {"type": ["integer", "null"]},
         }));
-        let coerced = coerce_string_scalars_at_top_level(
-            serde_json::json!({"max_iterations": "20"}),
-            &schema,
-        );
-        assert_eq!(coerced, serde_json::json!({"max_iterations": 20}));
+        let coerced =
+            coerce_string_scalars_at_top_level(serde_json::json!({"item_count": "20"}), &schema);
+        assert_eq!(coerced, serde_json::json!({"item_count": 20}));
     }
 
     #[test]
@@ -1790,7 +1784,7 @@ mod tests {
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     struct CoercibleArgs {
-        max_iterations: usize,
+        item_count: usize,
         full_page: bool,
         temperature: f32,
         label: String,
@@ -1816,8 +1810,8 @@ mod tests {
         ) -> Result<ToolResult, ToolError> {
             // Echo the parsed values so the test can assert coercion happened.
             Ok(ToolResult::text(format!(
-                "max_iterations={} full_page={} temperature={} label={}",
-                args.max_iterations, args.full_page, args.temperature, args.label
+                "item_count={} full_page={} temperature={} label={}",
+                args.item_count, args.full_page, args.temperature, args.label
             )))
         }
     }
@@ -1834,7 +1828,7 @@ mod tests {
             &tool,
             "call_1",
             serde_json::json!({
-                "max_iterations": "50",
+                "item_count": "50",
                 "full_page": "True",
                 "temperature": "0.7",
                 "label": "actual string",
@@ -1848,7 +1842,7 @@ mod tests {
             panic!("expected text result");
         };
         assert!(
-            t.text.contains("max_iterations=50"),
+            t.text.contains("item_count=50"),
             "integer coercion missing: {}",
             t.text
         );
@@ -1883,7 +1877,7 @@ mod tests {
             &tool,
             "call_2",
             serde_json::json!({
-                "max_iterations": "fifty",
+                "item_count": "fifty",
                 "full_page": true,
                 "temperature": 0.1,
                 "label": "x",

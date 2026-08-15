@@ -370,7 +370,6 @@ async fn loop_runs_one_tool_call_then_finishes() {
         .before_tool_call(BlockBananas)
         .after_tool_call(TerminateOnMarker)
         .event_observer_arc(counter.clone())
-        .max_iterations(10)
         .build()
         .unwrap();
 
@@ -454,7 +453,6 @@ async fn before_hook_blocks_tool_call() {
         .tools(registry)
         .event_sink(Arc::new(sink))
         .before_tool_call(BlockBananas)
-        .max_iterations(10)
         .build()
         .unwrap();
 
@@ -540,7 +538,6 @@ async fn max_tool_calls_per_turn_preserves_extra_calls_with_error_results() {
         .tools(registry)
         .event_sink(Arc::new(sink))
         .max_tool_calls_per_turn(1)
-        .max_iterations(10)
         .build()
         .unwrap();
 
@@ -658,7 +655,6 @@ async fn ok_tool_result_can_still_mark_context_error() {
     let config = AgentBuilder::new()
         .stream(stream)
         .tools(registry)
-        .max_iterations(10)
         .build()
         .unwrap();
 
@@ -705,7 +701,6 @@ async fn execution_tool_error_remains_context_event() {
     let config = AgentBuilder::new()
         .stream(stream)
         .tools(registry)
-        .max_iterations(10)
         .build()
         .unwrap();
 
@@ -742,11 +737,7 @@ async fn transient_stream_error_retries_until_cancelled() {
         kind: StreamErrorKind::Transient,
         message: "rate limited".into(),
     }]));
-    let config = AgentBuilder::new()
-        .stream(stream)
-        .max_iterations(10)
-        .build()
-        .unwrap();
+    let config = AgentBuilder::new().stream(stream).build().unwrap();
 
     let signal = CancellationToken::new();
     let cancel = signal.clone();
@@ -781,7 +772,6 @@ async fn aborted_stream_error_emits_aborted_message_end() {
     let config = AgentBuilder::new()
         .stream(stream)
         .event_sink(Arc::new(sink))
-        .max_iterations(10)
         .build()
         .unwrap();
 
@@ -830,11 +820,7 @@ async fn aborted_stream_error_emits_aborted_message_end() {
 #[tokio::test(start_paused = true)]
 async fn empty_stream_retries_until_cancelled() {
     let stream = Arc::new(EventScriptedStream::new(Vec::new()));
-    let config = AgentBuilder::new()
-        .stream(stream)
-        .max_iterations(10)
-        .build()
-        .unwrap();
+    let config = AgentBuilder::new().stream(stream).build().unwrap();
 
     let signal = CancellationToken::new();
     let cancel = signal.clone();
@@ -870,11 +856,7 @@ async fn assistant_error_stop_reason_is_retried() {
             usage: None,
         },
     ]));
-    let config = AgentBuilder::new()
-        .stream(stream)
-        .max_iterations(10)
-        .build()
-        .unwrap();
+    let config = AgentBuilder::new().stream(stream).build().unwrap();
 
     let result = clark_agent::run(
         vec![AgentMessage::User {
@@ -914,7 +896,6 @@ async fn retained_tool_update_sender_does_not_hang_after_tool_returns() {
     let config = AgentBuilder::new()
         .stream(stream)
         .tools(registry)
-        .max_iterations(10)
         .build()
         .unwrap();
 
@@ -951,7 +932,6 @@ async fn fatal_tool_error_propagates_out_of_loop() {
     let config = AgentBuilder::new()
         .stream(stream)
         .tools(registry)
-        .max_iterations(10)
         .build()
         .unwrap();
 
@@ -981,7 +961,6 @@ async fn aborted_tool_error_propagates_out_of_loop() {
     let config = AgentBuilder::new()
         .stream(stream)
         .tools(registry)
-        .max_iterations(10)
         .build()
         .unwrap();
 

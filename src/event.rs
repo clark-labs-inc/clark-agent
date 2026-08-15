@@ -99,12 +99,11 @@ pub enum AgentEvent {
 
     /// The loop discarded a truncated assistant turn and re-streamed
     /// with a higher `max_output_tokens` cap. Emitted once per
-    /// retry attempt; multiple events for the same turn signal the
-    /// recovery walked the configured ladder. See
-    /// [`crate::config::MaxTokensRecovery`].
+    /// retry attempt; multiple events for the same turn signal automatic
+    /// cap growth while the provider continues truncating.
     OutputTokensEscalation {
         /// 1-indexed retry counter within the current turn.
-        attempt: u8,
+        attempt: u32,
         /// Cap that produced the truncated turn we're discarding.
         prev_cap: u32,
         /// Cap we're re-streaming with.

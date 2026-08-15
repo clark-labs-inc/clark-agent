@@ -36,25 +36,17 @@ pub enum LoopError {
     /// (which the model would not respond to).
     #[error("cannot continue: {0}")]
     InvalidContinuation(String),
-
-    /// The model repeatedly stopped without any tool call after the
-    /// configured no-tool recovery budget had already been spent.
-    #[error(
-        "empty assistant outcome retry budget exhausted: observed {observed} no-tool assistant stop(s), budget {budget}"
-    )]
-    EmptyOutcomeBudgetExhausted { budget: usize, observed: usize },
 }
 
 #[derive(Debug, Error)]
 pub enum StreamError {
     /// Transient failure: rate limit, network blip, retryable provider
-    /// error. The transport implementation decides whether to retry
-    /// internally or surface this.
+    /// error. The loop retries these until caller cancellation.
     #[error("transient stream error: {0}")]
     Transient(String),
 
     /// The selected model/provider is temporarily rate-limited. The
-    /// transport exhausted its own retry budget before surfacing this.
+    /// loop retries until the provider recovers or the caller cancels.
     #[error("provider rate-limited request: {0}")]
     ProviderRateLimited(String),
 

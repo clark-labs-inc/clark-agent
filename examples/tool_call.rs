@@ -96,7 +96,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentBuilder::new()
         .stream(Arc::new(ScriptedStream::new(vec![call_echo, final_answer])))
         .tools(registry)
-        .max_iterations(4)
         .build()?;
 
     let outcome = run(

@@ -245,7 +245,6 @@ async fn sibling_aborts_when_failing_tool_opts_in() {
     let config = AgentBuilder::new()
         .stream(Arc::new(stream))
         .tools(registry)
-        .max_iterations(5)
         .build()
         .expect("builder");
 
@@ -327,7 +326,6 @@ async fn opt_out_failures_do_not_abort_siblings() {
     let config = AgentBuilder::new()
         .stream(Arc::new(stream))
         .tools(registry)
-        .max_iterations(5)
         .build()
         .expect("builder");
 
@@ -366,7 +364,6 @@ async fn sequential_batch_does_not_start_later_siblings_after_opt_in_failure() {
         .stream(Arc::new(stream))
         .tools(registry)
         .default_execution_mode(ExecutionMode::Sequential)
-        .max_iterations(5)
         .build()
         .expect("builder");
 
@@ -422,7 +419,6 @@ async fn sequential_batch_runs_later_siblings_after_opt_in_success() {
         .stream(Arc::new(stream))
         .tools(registry)
         .default_execution_mode(ExecutionMode::Sequential)
-        .max_iterations(5)
         .build()
         .expect("builder");
 
@@ -533,7 +529,6 @@ async fn baseline_parallelism_preserved_with_sibling_abort_path() {
     let config = AgentBuilder::new()
         .stream(Arc::new(stream))
         .tools(registry)
-        .max_iterations(5)
         .build()
         .expect("builder");
 

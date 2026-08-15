@@ -57,10 +57,7 @@ pub mod trajectory;
 pub mod types;
 
 pub use budget::TokenBudget;
-pub use config::{
-    AgentBuilder, LoopConfig, MaxTokensRecovery, PluginNames, TokenScaling,
-    DEFAULT_GRACE_ITERATIONS,
-};
+pub use config::{AgentBuilder, LoopConfig, PluginNames};
 pub use error::{LoopError, StreamError, ToolError, ToolValidationError};
 pub use event::ChannelSink;
 pub use event::{AgentEvent, EventSink, ProviderRequestSummary};
@@ -70,7 +67,6 @@ pub use plugin::{
     AfterToolCall, AfterToolDecision, BeforeToolCall, BeforeToolDecision, ContextOverflowRecovery,
     ContextTransform, EventObserver, FollowUpSource, Plugin, SteeringSource, TransformContext,
 };
-pub use plugins::GracefulTurnLimit;
 pub use protocol::{
     DefaultProtocolPolicy, HiddenToolContext, HiddenToolError, PlainTextRecoveryContext,
     ProtocolPolicy, DEFAULT_PLAIN_TEXT_RECOVERY_PROMPT,

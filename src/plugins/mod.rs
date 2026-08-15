@@ -5,8 +5,6 @@
 //! plugin is a regular [`Plugin`](crate::plugin::Plugin) implementation —
 //! nothing magic about its placement here.
 
-pub mod graceful_turn_limit;
 pub mod opening_gate;
 
-pub use graceful_turn_limit::GracefulTurnLimit;
 pub use opening_gate::OpeningGate;

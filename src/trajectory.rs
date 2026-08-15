@@ -174,7 +174,7 @@ pub enum TrajectoryPayload {
     },
     /// The loop discarded a truncated turn and re-streamed.
     OutputTokensEscalation {
-        attempt: u8,
+        attempt: u32,
         prev_cap: u32,
         new_cap: u32,
     },

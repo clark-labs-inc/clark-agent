@@ -81,7 +81,6 @@ let config = AgentBuilder::new()
     .before_tool_call(my_security_gate())
     .after_tool_call(my_repeat_detector())
     .context_transform(clark_agent::budget::TokenBudget::default())
-    .max_iterations(50)
     .build()?;
 
 let outcome = clark_agent::run(

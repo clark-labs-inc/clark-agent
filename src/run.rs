@@ -46,47 +46,26 @@ It may have produced private-only reasoning or an unusable burst of partial tool
 Do not continue with private reasoning only. Re-read the latest observation and immediately choose exactly one next structured tool call; \
 if the answer is ready, use the final response tool.";
 
-/// Hard cap on consecutive plain-text-fallback nudges before the loop
-/// falls back to synthesizing a terminal tool result as a last resort.
-/// Two nudges plus one synthesize keeps the recovery window bounded
-/// without leaning on a caller-configured `empty_outcome_retry_budget`.
-const MAX_PLAIN_TEXT_NUDGE_RETRIES: usize = 2;
-
 /// Outcome label for a completed run.
 ///
-/// Distinguishes natural termination from budget-pressure terminations so
-/// callers (notably parent agents reading a subagent's tool result) can
-/// reason about whether the answer is complete or partial. All variants
-/// are non-error — a hard error becomes [`LoopError`].
+/// A hard error becomes [`LoopError`]; caller cancellation is the only
+/// external lifetime boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopOutcome {
     /// Model emitted a final assistant turn with no tool calls and no
     /// pending steering. The natural happy path.
     Done,
-    /// The graceful turn-limit plugin injected a wrap-up steering message
-    /// and the model produced a clean final turn within the grace window.
-    /// Result text reflects the model's deliberate close-out, not a
-    /// truncated transcript.
-    WrappedUp,
-    /// `max_iterations` was reached before the model wrapped up. The run
-    /// stopped at the cap, but earlier turns are still in the transcript.
-    /// The most recent assistant turn may have had pending tool calls.
-    HitMaxIterations,
 }
 
 impl LoopOutcome {
     /// Whether this outcome implies a clean, non-partial final answer.
     pub fn is_complete(self) -> bool {
-        matches!(self, LoopOutcome::Done | LoopOutcome::WrappedUp)
+        true
     }
 
     /// Short stable label suitable for logs and tool-result prefixes.
     pub fn label(self) -> &'static str {
-        match self {
-            LoopOutcome::Done => "done",
-            LoopOutcome::WrappedUp => "wrapped_up",
-            LoopOutcome::HitMaxIterations => "hit_max_iterations",
-        }
+        "done"
     }
 }
 
@@ -94,8 +73,7 @@ impl LoopOutcome {
 ///
 /// Returned by [`run`] and [`run_continue`]. `messages` is the slice of
 /// messages produced **during this run** (not the full transcript).
-/// `outcome` lets callers distinguish a natural close from a budget-driven
-/// one without inspecting message content.
+/// `outcome` records the natural close without requiring message inspection.
 #[derive(Debug, Clone)]
 pub struct RunResult {
     pub messages: Vec<AgentMessage>,
@@ -206,9 +184,6 @@ async fn inner_run(
 ) -> Result<LoopOutcome, LoopError> {
     let mut first_turn = true;
     let mut iterations: usize = 0;
-    let mut empty_outcomes_seen: usize = 0;
-    let mut last_turn_stopped_without_tool = false;
-    let mut plain_text_terminal_fallback_candidate: Option<AgentMessage> = None;
 
     // Steering messages may already be queued (caller produced them
     // before calling `run`).
@@ -236,16 +211,6 @@ async fn inner_run(
         while has_more_tool_calls || !pending.is_empty() {
             if signal.is_cancelled() {
                 return Err(LoopError::Aborted);
-            }
-            if let Some(max) = config.max_iterations {
-                if iterations >= max {
-                    // Hit the iteration cap. Break out of the inner
-                    // loop so the follow-up sources get one last
-                    // chance to inject a terminator nudge before the
-                    // run ends. The outer loop's own cap-check (added
-                    // below) ensures we don't loop forever.
-                    break;
-                }
             }
             iterations += 1;
 
@@ -300,10 +265,6 @@ async fn inner_run(
                 }
                 _ => Vec::new(),
             };
-            last_turn_stopped_without_tool = tool_calls.is_empty();
-            if last_turn_stopped_without_tool {
-                empty_outcomes_seen = empty_outcomes_seen.saturating_add(1);
-            }
 
             let mut tool_result_messages = Vec::new();
             has_more_tool_calls = false;
@@ -317,28 +278,15 @@ async fn inner_run(
                         tool_name,
                         &terminal_tool_names,
                     );
-                    let preserve_plain_text_candidate = plain_assistant_text(&assistant)
-                        .is_some_and(|text| should_preserve_plain_text_terminal_candidate(&text));
-                    if plain_text_terminal_fallback_candidate.is_none()
-                        && preserve_plain_text_candidate
-                    {
-                        plain_text_terminal_fallback_candidate = Some(assistant.clone());
-                    }
                     let nudge_mode = config.plain_text_terminal_fallback_eager_nudge
                         && eager
-                        && !narrowed_to_terminators
-                        && empty_outcomes_seen <= MAX_PLAIN_TEXT_NUDGE_RETRIES;
+                        && !narrowed_to_terminators;
                     if nudge_mode {
                         // Catalog still contains real work tools (e.g. `plan`)
                         // but the model emitted prose. Inject an explicit
                         // protocol-recovery system message and force the
                         // inner loop to re-stream rather than laundering
                         // the prose into a synthetic `message_result`.
-                        // After MAX_PLAIN_TEXT_NUDGE_RETRIES the synthesizer
-                        // below fires as a last resort, preferring the first
-                        // preserved non-clarifying answer so retry drift does
-                        // not replace a good response with recovery chatter.
-                        //
                         // Push directly into `current.messages` (mirrors the
                         // synthesize path) rather than `pending`, which is
                         // overwritten by `collect_steering` at end-of-iter.
@@ -370,17 +318,12 @@ async fn inner_run(
                         new_messages.push(nudge);
                         has_more_tool_calls = true;
                     } else if let Some(result_msg) = synthesize_plain_text_terminal_result(
-                        plain_text_terminal_fallback_candidate
-                            .as_ref()
-                            .unwrap_or(&assistant),
+                        &assistant,
                         turn_allowlist.as_ref(),
                         tool_name,
                         eager,
                         &terminal_tool_names,
                     ) {
-                        plain_text_terminal_fallback_candidate = None;
-                        last_turn_stopped_without_tool = false;
-                        empty_outcomes_seen = 0;
                         last_batch_terminated = true;
                         current.messages.push(result_msg.clone());
                         new_messages.push(result_msg.clone());
@@ -401,10 +344,6 @@ async fn inner_run(
                 )
                 .await?;
 
-                // A real tool batch is forward progress; the empty-outcome
-                // budget tracks being stuck, not lifetime empty stops.
-                empty_outcomes_seen = 0;
-                plain_text_terminal_fallback_candidate = None;
                 tool_result_messages = messages;
                 has_more_tool_calls = !terminate;
                 last_batch_terminated = terminate;
@@ -436,14 +375,8 @@ async fn inner_run(
             };
         }
 
-        // Inner loop exhausted: either (a) the model produced no tool
-        // calls AND no steering is queued, or (b) we hit the iteration
-        // cap. In either case, give the follow-up sources one last
-        // chance to inject a terminator nudge before declaring the
-        // run done. To prevent infinite looping when a follow-up
-        // re-arms but we're already past the cap, exit unconditionally
-        // if the cap was hit.
-        let cap_hit = config.max_iterations.is_some_and(|max| iterations >= max);
+        // The model produced no tool calls and no steering is queued. Give
+        // follow-up sources one last chance to inject another turn.
         // Skip the follow-up source pass when the last batch
         // terminated for the same reason steering is skipped above:
         // a clean terminator vote means the run is done; follow-up
@@ -454,50 +387,9 @@ async fn inner_run(
         } else {
             collect_follow_up(config).await
         };
-        if last_turn_stopped_without_tool {
-            if let Some(budget) = config.empty_outcome_retry_budget {
-                if empty_outcomes_seen > budget {
-                    emit(
-                        config,
-                        AgentEvent::AgentEnd {
-                            messages: new_messages.clone(),
-                        },
-                    )
-                    .await;
-                    return Err(LoopError::EmptyOutcomeBudgetExhausted {
-                        budget,
-                        observed: empty_outcomes_seen,
-                    });
-                }
-            }
-        }
-        if !follow_up.is_empty() && !cap_hit {
+        if !follow_up.is_empty() {
             pending = follow_up;
             continue 'outer;
-        }
-        // If the cap was hit but a follow-up was produced, append it
-        // to the transcript so listeners see the final nudge — but do
-        // NOT re-enter the LLM loop. The user-facing run still ends
-        // with this message as the last appended turn.
-        if cap_hit {
-            for msg in follow_up {
-                emit(
-                    config,
-                    AgentEvent::MessageStart {
-                        message: msg.clone(),
-                    },
-                )
-                .await;
-                emit(
-                    config,
-                    AgentEvent::MessageEnd {
-                        message: msg.clone(),
-                    },
-                )
-                .await;
-                current.messages.push(msg.clone());
-                new_messages.push(msg);
-            }
         }
 
         break;
@@ -511,27 +403,7 @@ async fn inner_run(
     )
     .await;
 
-    // Classify outcome.
-    // - HitMaxIterations: hard cap was reached before the model stopped
-    //   tool-calling. The transcript may end on a turn that wanted to do
-    //   more.
-    // - WrappedUp: the graceful-turn-limit plugin fired its one-shot
-    //   wrap-up steer AND we exited naturally (cap not hit). The model
-    //   responded to the warning and produced a clean close.
-    // - Done: natural termination with no budget pressure.
-    let cap_hit_final = config.max_iterations.is_some_and(|max| iterations >= max);
-    let wrap_up_fired = config
-        .grace_signal
-        .as_ref()
-        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
-    let outcome = if cap_hit_final {
-        LoopOutcome::HitMaxIterations
-    } else if wrap_up_fired {
-        LoopOutcome::WrappedUp
-    } else {
-        LoopOutcome::Done
-    };
-    Ok(outcome)
+    Ok(LoopOutcome::Done)
 }
 
 async fn collect_steering(config: &LoopConfig) -> Vec<AgentMessage> {
@@ -589,35 +461,6 @@ fn plain_assistant_text(assistant: &AgentMessage) -> Option<String> {
         .trim()
         .to_string();
     (!text.is_empty()).then_some(text)
-}
-
-fn should_preserve_plain_text_terminal_candidate(text: &str) -> bool {
-    !looks_like_permission_or_clarification_question(text)
-}
-
-fn looks_like_permission_or_clarification_question(text: &str) -> bool {
-    let trimmed = text.trim();
-    if !trimmed.contains('?') {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let starts_with_prompt = [
-        "would you like",
-        "shall i",
-        "should i",
-        "do you want",
-        "what would you like",
-        "what do you need",
-        "what's your next move",
-        "what is your next move",
-        "continue what",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix));
-    starts_with_prompt
-        || (trimmed.len() <= 500
-            && lower.contains("what")
-            && (lower.contains("next") || lower.contains("continue")))
 }
 
 /// Whether a turn's allowlist has narrowed to "terminal only" — it
@@ -729,7 +572,7 @@ async fn stream_with_max_tokens_recovery(
     iteration: usize,
 ) -> Result<(AgentMessage, Option<std::collections::HashSet<String>>), LoopError> {
     let mut current_cap = config.max_output_tokens;
-    let mut max_tokens_attempt: u8 = 0;
+    let mut max_tokens_attempt: u32 = 0;
     let mut empty_stream_attempts: u32 = 0;
     let mut zero_output_transport_attempts: u32 = 0;
     let mut transient_stream_attempts: u32 = 0;
@@ -813,12 +656,6 @@ async fn stream_with_max_tokens_recovery(
         if stop_reason != StopReason::MaxTokens {
             return Ok((assistant, allowlist));
         }
-        let Some(recovery) = config.max_output_tokens_recovery.as_ref() else {
-            return Ok((assistant, allowlist));
-        };
-        if max_tokens_attempt >= recovery.max_attempts {
-            return Ok((assistant, allowlist));
-        }
         // No starting cap means there's no number to scale from. Refuse
         // recovery rather than guess — the deployment hadn't pinned a
         // cap, so the truncation came from a provider-side limit we
@@ -826,9 +663,10 @@ async fn stream_with_max_tokens_recovery(
         let Some(prev_cap) = current_cap else {
             return Ok((assistant, allowlist));
         };
-        let Some(new_cap) = recovery.next_cap(prev_cap, max_tokens_attempt) else {
+        let new_cap = prev_cap.saturating_mul(2);
+        if new_cap <= prev_cap {
             return Ok((assistant, allowlist));
-        };
+        }
 
         max_tokens_attempt = max_tokens_attempt.saturating_add(1);
         emit(
@@ -1371,13 +1209,9 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    #[derive(Default)]
-    struct EmptyStopsAroundProgressStream {
+    struct PlainTextThenTerminatorStream {
         calls: AtomicUsize,
-    }
-
-    struct CountingFollowUp {
-        remaining: AtomicUsize,
+        plain_text_turns: usize,
     }
 
     struct TerminalOnlyGate;
@@ -1486,40 +1320,12 @@ mod tests {
         }
     }
 
-    impl CountingFollowUp {
-        fn new(remaining: usize) -> Self {
+    impl PlainTextThenTerminatorStream {
+        fn new(plain_text_turns: usize) -> Self {
             Self {
-                remaining: AtomicUsize::new(remaining),
+                calls: AtomicUsize::new(0),
+                plain_text_turns,
             }
-        }
-    }
-
-    impl Plugin for CountingFollowUp {
-        fn name(&self) -> &'static str {
-            "counting_follow_up"
-        }
-
-        fn capabilities(&self) -> PluginCapabilities {
-            PluginCapabilities::follow_up()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl FollowUpSource for CountingFollowUp {
-        async fn next_follow_up_messages(&self) -> Vec<AgentMessage> {
-            let used = self
-                .remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .unwrap_or(0);
-            if used == 0 {
-                return Vec::new();
-            }
-            vec![AgentMessage::System {
-                content: "retry after no-tool stop".into(),
-                timestamp: None,
-            }]
         }
     }
 
@@ -1572,7 +1378,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl StreamFn for EmptyStopsAroundProgressStream {
+    impl StreamFn for PlainTextThenTerminatorStream {
         async fn stream(
             &self,
             _request: StreamRequest,
@@ -1580,11 +1386,12 @@ mod tests {
         ) -> BoxStream<'static, StreamEvent> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let partial = empty_assistant_message();
-            let message = match call {
-                0 | 2 | 4 => text_assistant_message(format!("plain stop {call}")),
-                1 | 3 => tool_call_assistant_message("progress", format!("tc-progress-{call}")),
-                5 => tool_call_assistant_message("terminator", "tc-terminator"),
-                other => panic!("unexpected stream call after terminal turn: {other}"),
+            let message = if call < self.plain_text_turns {
+                text_assistant_message(format!("plain stop {call}"))
+            } else if call == self.plain_text_turns {
+                tool_call_assistant_message("terminator", "tc-terminator")
+            } else {
+                panic!("unexpected stream call after terminal turn: {call}")
             };
             Box::pin(stream::iter(vec![
                 StreamEvent::Start { partial },
@@ -1805,10 +1612,8 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_up_is_complete() {
+    fn done_is_complete() {
         assert!(LoopOutcome::Done.is_complete());
-        assert!(LoopOutcome::WrappedUp.is_complete());
-        assert!(!LoopOutcome::HitMaxIterations.is_complete());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1971,33 +1776,6 @@ mod tests {
         }
     }
 
-    struct ProgressTool;
-
-    #[async_trait::async_trait]
-    impl crate::tool::AgentTool for ProgressTool {
-        fn name(&self) -> &str {
-            "progress"
-        }
-
-        fn description(&self) -> &str {
-            "test progress tool"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-
-        async fn execute(
-            &self,
-            _call_id: &str,
-            _args: serde_json::Value,
-            _signal: CancellationToken,
-            _update: tokio::sync::mpsc::UnboundedSender<crate::tool::ToolResult>,
-        ) -> Result<crate::tool::ToolResult, crate::error::ToolError> {
-            Ok(crate::tool::ToolResult::text("made progress"))
-        }
-    }
-
     /// `SteeringSource` that always returns one wrap-up message. Used
     /// to prove the loop does NOT poll steering after a terminator
     /// vote (otherwise this would re-enter the LLM and trip the
@@ -2066,8 +1844,7 @@ mod tests {
 
         // Exactly one LLM call — the terminator turn.
         assert_eq!(stream.calls.load(Ordering::SeqCst), 1);
-        // Outcome is a clean Done, not WrappedUp (no graceful flag) and
-        // not HitMaxIterations.
+        // Outcome is a clean natural completion.
         assert_eq!(result.outcome, LoopOutcome::Done);
         // Steering source is consulted exactly once — the pre-loop
         // priming poll at the top of `inner_run`. After the terminator
@@ -2144,39 +1921,6 @@ mod tests {
             0,
             "follow-up source polled after a terminator vote — terminator did not gate post-batch re-entry"
         );
-    }
-
-    #[tokio::test]
-    async fn exhausted_empty_outcome_budget_returns_typed_loop_error() {
-        let stream = Arc::new(RepeatedTextStream::default());
-        let config = AgentBuilder::new()
-            .stream(stream.clone())
-            .model_id("test-model")
-            .empty_outcome_retry_budget(1)
-            .follow_up(CountingFollowUp::new(1))
-            .build()
-            .expect("config builds");
-        let context = AgentContext::new("system");
-        let prompts = vec![AgentMessage::User {
-            content: UserContent::Text("continue".to_string()),
-            timestamp: None,
-        }];
-
-        let err = run(prompts, context, &config, CancellationToken::new())
-            .await
-            .expect_err("second no-tool stop should exhaust the budget");
-
-        assert!(
-            matches!(
-                err,
-                LoopError::EmptyOutcomeBudgetExhausted {
-                    budget: 1,
-                    observed: 2,
-                }
-            ),
-            "unexpected error: {err:?}"
-        );
-        assert_eq!(stream.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -2261,35 +2005,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn productive_tool_batch_resets_empty_outcome_budget() {
-        let stream = Arc::new(EmptyStopsAroundProgressStream::default());
-        let mut tool_registry = crate::tool::ToolRegistry::new();
-        tool_registry = tool_registry
-            .with(Arc::new(ProgressTool))
-            .with(Arc::new(TerminatorTool));
-        let config = AgentBuilder::new()
-            .stream(stream.clone())
-            .model_id("test-model")
-            .tools(tool_registry)
-            .empty_outcome_retry_budget(1)
-            .follow_up(CountingFollowUp::new(3))
-            .build()
-            .expect("config builds");
-        let context = AgentContext::new("system");
-        let prompts = vec![AgentMessage::User {
-            content: UserContent::Text("continue".to_string()),
-            timestamp: None,
-        }];
-
-        let result = run(prompts, context, &config, CancellationToken::new())
-            .await
-            .expect("productive tool batches should reset the empty-outcome budget");
-
-        assert_eq!(result.outcome, LoopOutcome::Done);
-        assert_eq!(stream.calls.load(Ordering::SeqCst), 6);
-    }
-
-    #[tokio::test]
     async fn terminal_only_plain_text_fallback_synthesizes_terminal_result() {
         let stream = Arc::new(RepeatedTextStream::default());
         let mut tool_registry = crate::tool::ToolRegistry::new();
@@ -2300,7 +2015,6 @@ mod tests {
             .tools(tool_registry)
             .tool_gate_arc(Arc::new(TerminalOnlyGate))
             .plain_text_terminal_fallback_tool("message_result")
-            .empty_outcome_retry_budget(0)
             .build()
             .expect("config builds");
         let context = AgentContext::new("system");
@@ -2338,8 +2052,7 @@ mod tests {
         //
         // No `tool_gate_arc` is installed in this test, so the catalog
         // stays at the full registry — exactly the situation where the
-        // non-eager path would refuse to convert and the run would die
-        // on the empty-outcome budget.
+        // non-eager path would refuse to convert.
         let stream = Arc::new(RepeatedTextStream::default());
         let mut tool_registry = crate::tool::ToolRegistry::new();
         tool_registry = tool_registry.with(Arc::new(TerminalNamedTool("message_result")));
@@ -2349,7 +2062,6 @@ mod tests {
             .tools(tool_registry)
             .plain_text_terminal_fallback_tool("message_result")
             .plain_text_terminal_fallback_eager(true)
-            .empty_outcome_retry_budget(0)
             .build()
             .expect("config builds");
         let context = AgentContext::new("system");
@@ -2377,20 +2089,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eager_nudge_mode_injects_protocol_recovery_before_synthesizing() {
+    async fn eager_nudge_mode_has_no_implicit_retry_ceiling() {
         // With `plain_text_terminal_fallback_eager_nudge(true)` the eager
         // path nudges the model with a protocol-recovery system message
-        // on each consecutive plain-text stop, up to
-        // `MAX_PLAIN_TEXT_NUDGE_RETRIES`. After the cap a synthesizer
-        // fires as a last resort so the run still terminates with the
-        // model's prose as the delivered text — never silently, never
-        // forever. Verifies the recovery path is observable in the
-        // emitted message stream (the model sees the nudges in context)
-        // and that the synthesizer ultimately delivers the first
-        // substantive plain-text answer, not later recovery drift.
-        let stream = Arc::new(RepeatedTextStream::default());
+        // on every consecutive plain-text stop. Four failures exceed the
+        // deleted two-nudge cap; the fifth turn supplies the real terminal
+        // tool call rather than relying on synthesized completion.
+        let stream = Arc::new(PlainTextThenTerminatorStream::new(4));
         let mut tool_registry = crate::tool::ToolRegistry::new();
-        tool_registry = tool_registry.with(Arc::new(TerminalNamedTool("message_result")));
+        tool_registry = tool_registry
+            .with(Arc::new(TerminalNamedTool("message_result")))
+            .with(Arc::new(TerminatorTool));
         let config = AgentBuilder::new()
             .stream(stream.clone())
             .model_id("auto-tool-provider-eager-nudge")
@@ -2408,11 +2117,9 @@ mod tests {
 
         let result = run(prompts, context, &config, CancellationToken::new())
             .await
-            .expect("nudge mode should eventually synthesize after retries");
+            .expect("nudge mode should wait for a real terminal tool call");
 
-        // MAX_PLAIN_TEXT_NUDGE_RETRIES = 2 → two nudges fire, then on the
-        // third empty stop the synthesizer takes over. Total LLM calls = 3.
-        assert_eq!(stream.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 5);
         assert_eq!(result.outcome, LoopOutcome::Done);
 
         let nudge_count = result
@@ -2421,48 +2128,16 @@ mod tests {
             .filter(|m| matches!(m, AgentMessage::System { content, .. } if content == crate::protocol::DEFAULT_PLAIN_TEXT_RECOVERY_PROMPT))
             .count();
         assert_eq!(
-            nudge_count, 2,
-            "expected two protocol-recovery system messages in the run output, got {nudge_count}",
+            nudge_count, 4,
+            "expected one protocol-recovery message per plain-text turn, got {nudge_count}",
         );
-
-        let synthesized_text = result
-            .messages
-            .iter()
-            .find_map(|message| match message {
-                AgentMessage::ToolResult {
-                    tool_name,
-                    content,
-                    is_error: false,
-                    ..
-                } if tool_name == "message_result" => Some(content.plain_text()),
-                _ => None,
-            })
-            .expect("a terminal tool result should be synthesized as last resort");
-        assert_eq!(
-            synthesized_text, "plain stop 0",
-            "synthesizer should deliver the first preserved plain text, not later recovery drift",
-        );
-    }
-
-    #[test]
-    fn plain_text_fallback_candidate_skips_obvious_clarifying_questions() {
-        assert!(!should_preserve_plain_text_terminal_candidate(
-            "Continue what, exactly? What's your next move?"
-        ));
-        assert!(!should_preserve_plain_text_terminal_candidate(
-            "Would you like me to proceed?"
-        ));
-        assert!(should_preserve_plain_text_terminal_candidate(
-            "# Machine Learning\n\nMachine learning is the branch of artificial intelligence that studies systems which improve from data."
-        ));
     }
 
     #[tokio::test]
     async fn non_eager_plain_text_fallback_still_requires_narrowed_allowlist() {
         // Default behaviour preserved: when eager is NOT set and the
         // turn allowlist is the full catalog, plain text is NOT
-        // converted — the run dies on the empty-outcome budget,
-        // matching the pre-eager contract for every other model.
+        // converted. It remains the run's natural assistant completion.
         let stream = Arc::new(RepeatedTextStream::default());
         let mut tool_registry = crate::tool::ToolRegistry::new();
         tool_registry = tool_registry.with(Arc::new(TerminalNamedTool("message_result")));
@@ -2472,7 +2147,6 @@ mod tests {
             .tools(tool_registry)
             .plain_text_terminal_fallback_tool("message_result")
             // Eager NOT set → defaults to false.
-            .empty_outcome_retry_budget(0)
             .build()
             .expect("config builds");
         let context = AgentContext::new("system");
@@ -2481,14 +2155,15 @@ mod tests {
             timestamp: None,
         }];
 
-        let err = run(prompts, context, &config, CancellationToken::new())
+        let result = run(prompts, context, &config, CancellationToken::new())
             .await
-            .expect_err("non-eager fallback must not convert without narrowed allowlist");
+            .expect("plain assistant completion should remain valid");
 
-        assert!(
-            matches!(err, LoopError::EmptyOutcomeBudgetExhausted { .. }),
-            "unexpected error: {err:?}"
-        );
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 1);
+        assert!(!result.messages.iter().any(|message| matches!(
+            message,
+            AgentMessage::ToolResult { tool_name, .. } if tool_name == "message_result"
+        )));
     }
 
     #[tokio::test]
@@ -2503,7 +2178,6 @@ mod tests {
             .protocol_policy(Arc::new(TestTerminalPolicy))
             .tool_gate_arc(Arc::new(TerminalWithStatusGate))
             .plain_text_terminal_fallback_tool("message_result")
-            .empty_outcome_retry_budget(0)
             .build()
             .expect("config builds");
         let context = AgentContext::new("system");

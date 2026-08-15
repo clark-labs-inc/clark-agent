@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 use clark_agent::{
     run, AgentBuilder, AgentContext, AgentEvent, AgentMessage, AssistantContent, ChannelSink,
-    EventObserver, MaxTokensRecovery, Plugin, PluginCapabilities, StopReason, StreamEvent,
-    StreamFn, StreamRequest, TokenScaling, UserContent,
+    EventObserver, Plugin, PluginCapabilities, StopReason, StreamEvent, StreamFn, StreamRequest,
+    UserContent,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use std::sync::{
@@ -123,7 +123,6 @@ async fn recovery_doubles_cap_until_clean_turn() {
         .event_sink(Arc::new(sink))
         .event_observer(observer)
         .max_output_tokens(4096)
-        .max_output_tokens_recovery(MaxTokensRecovery::doubling())
         .build()
         .expect("builder");
 
@@ -185,99 +184,6 @@ async fn recovery_doubles_cap_until_clean_turn() {
 }
 
 #[tokio::test]
-async fn recovery_off_by_default_accepts_truncated_turn() {
-    let scripted = ScriptedStream::new(vec![truncated_assistant()]);
-    let counter = Arc::new(AtomicU32::new(0));
-    let observer = EscalationCounter {
-        count: counter.clone(),
-    };
-
-    let config = AgentBuilder::new()
-        .stream(scripted.clone() as Arc<dyn StreamFn>)
-        .event_observer(observer)
-        .max_output_tokens(4096)
-        // No .max_output_tokens_recovery() call.
-        .build()
-        .expect("builder");
-
-    let context = AgentContext::new("system");
-    let prompt = AgentMessage::User {
-        content: UserContent::Text("hi".into()),
-        timestamp: None,
-    };
-
-    let result = run(vec![prompt], context, &config, CancellationToken::new())
-        .await
-        .expect("run");
-
-    assert_eq!(counter.load(Ordering::Relaxed), 0);
-    // Truncated turn lands in the transcript when recovery is off.
-    let assistants: Vec<_> = result
-        .messages
-        .iter()
-        .filter(|m| matches!(m, AgentMessage::Assistant { .. }))
-        .collect();
-    assert_eq!(assistants.len(), 1);
-    let AgentMessage::Assistant { stop_reason, .. } = assistants[0] else {
-        unreachable!()
-    };
-    assert_eq!(*stop_reason, StopReason::MaxTokens);
-}
-
-#[tokio::test]
-async fn recovery_gives_up_after_max_attempts_and_accepts_truncated() {
-    // 4 truncated turns scripted; max_attempts=2 means the loop tries
-    // the original cap + 2 retries (3 total streamings) then accepts
-    // the third truncated turn.
-    let scripted = ScriptedStream::new(vec![
-        truncated_assistant(),
-        truncated_assistant(),
-        truncated_assistant(),
-    ]);
-    let counter = Arc::new(AtomicU32::new(0));
-    let observer = EscalationCounter {
-        count: counter.clone(),
-    };
-
-    let recovery = MaxTokensRecovery {
-        max_attempts: 2,
-        scaling: TokenScaling::Double,
-        ceiling: None,
-    };
-    let config = AgentBuilder::new()
-        .stream(scripted.clone() as Arc<dyn StreamFn>)
-        .event_observer(observer)
-        .max_output_tokens(4096)
-        .max_output_tokens_recovery(recovery)
-        .build()
-        .expect("builder");
-
-    let context = AgentContext::new("system");
-    let prompt = AgentMessage::User {
-        content: UserContent::Text("hi".into()),
-        timestamp: None,
-    };
-
-    let result = run(vec![prompt], context, &config, CancellationToken::new())
-        .await
-        .expect("run");
-
-    assert_eq!(counter.load(Ordering::Relaxed), 2);
-    assert_eq!(scripted.seen_caps.lock().unwrap().len(), 3);
-    // Final turn (truncated) is accepted into the transcript.
-    let assistants: Vec<_> = result
-        .messages
-        .iter()
-        .filter(|m| matches!(m, AgentMessage::Assistant { .. }))
-        .collect();
-    assert_eq!(assistants.len(), 1);
-    let AgentMessage::Assistant { stop_reason, .. } = assistants[0] else {
-        unreachable!()
-    };
-    assert_eq!(*stop_reason, StopReason::MaxTokens);
-}
-
-#[tokio::test]
 async fn recovery_skipped_when_no_starting_cap() {
     // Without an initial `max_output_tokens`, the recovery has no
     // number to scale from. The truncated turn is accepted as-is.
@@ -290,8 +196,7 @@ async fn recovery_skipped_when_no_starting_cap() {
     let config = AgentBuilder::new()
         .stream(scripted.clone() as Arc<dyn StreamFn>)
         .event_observer(observer)
-        .max_output_tokens_recovery(MaxTokensRecovery::doubling())
-        // No .max_output_tokens(...) call.
+        // No .max_output_tokens(...) call, so there is no cap to grow.
         .build()
         .expect("builder");
 

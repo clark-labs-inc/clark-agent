@@ -31,10 +31,7 @@ impl StreamFn for StaticStream {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = AgentBuilder::new()
-        .stream(Arc::new(StaticStream))
-        .max_iterations(4)
-        .build()?;
+    let config = AgentBuilder::new().stream(Arc::new(StaticStream)).build()?;
 
     let outcome = run(
         vec![AgentMessage::User {
