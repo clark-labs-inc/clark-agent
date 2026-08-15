@@ -844,7 +844,10 @@ async fn prepare_call(
     // before validation/dispatch.
     if let Some((parse_err, raw)) = detect_arg_parse_error(&call.arguments) {
         return PreparedCall::Immediate(ExecutedOutcome {
-            result: ToolResult::error(format_arg_parse_error(&call.name, parse_err, raw)),
+            result: ToolResult::argument_validation_error(
+                &call.name,
+                format_arg_parse_error(&call.name, parse_err, raw),
+            ),
             is_error: true,
         });
     }
@@ -853,7 +856,7 @@ async fn prepare_call(
 
     if let Err(err) = tool.validate(&prepared_args) {
         return PreparedCall::Immediate(ExecutedOutcome {
-            result: ToolResult::error(err.to_string()),
+            result: ToolResult::argument_validation_error(&call.name, err.to_string()),
             is_error: true,
         });
     }
