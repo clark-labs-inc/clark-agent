@@ -20,7 +20,7 @@ path = "src/lib.rs"
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
-schemars = { version = "0.8", features = ["derive", "preserve_order"] }
+schemars = { version = "1.2", features = ["derive", "preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
