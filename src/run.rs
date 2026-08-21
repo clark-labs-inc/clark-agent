@@ -55,17 +55,24 @@ pub enum LoopOutcome {
     /// Model emitted a final assistant turn with no tool calls and no
     /// pending steering. The natural happy path.
     Done,
+    /// The configured iteration ceiling was reached while more model work was
+    /// still pending. Earlier typed transcript events remain available, but
+    /// this is not a complete answer.
+    HitMaxIterations,
 }
 
 impl LoopOutcome {
     /// Whether this outcome implies a clean, non-partial final answer.
     pub fn is_complete(self) -> bool {
-        true
+        matches!(self, Self::Done)
     }
 
     /// Short stable label suitable for logs and tool-result prefixes.
     pub fn label(self) -> &'static str {
-        "done"
+        match self {
+            Self::Done => "done",
+            Self::HitMaxIterations => "hit_max_iterations",
+        }
     }
 }
 
@@ -184,6 +191,7 @@ async fn inner_run(
 ) -> Result<LoopOutcome, LoopError> {
     let mut first_turn = true;
     let mut iterations: usize = 0;
+    let mut hit_max_iterations = false;
 
     // Steering messages may already be queued (caller produced them
     // before calling `run`).
@@ -211,6 +219,13 @@ async fn inner_run(
         while has_more_tool_calls || !pending.is_empty() {
             if signal.is_cancelled() {
                 return Err(LoopError::Aborted);
+            }
+            if config
+                .max_iterations
+                .is_some_and(|max| iterations >= max)
+            {
+                hit_max_iterations = true;
+                break;
             }
             iterations += 1;
 
@@ -382,7 +397,7 @@ async fn inner_run(
         // a clean terminator vote means the run is done; follow-up
         // sources exist to nudge the model toward a terminator when
         // it failed to emit one, not to overrule one it already cast.
-        let follow_up = if last_batch_terminated {
+        let follow_up = if last_batch_terminated || hit_max_iterations {
             Vec::new()
         } else {
             collect_follow_up(config).await
@@ -390,6 +405,10 @@ async fn inner_run(
         if !follow_up.is_empty() {
             pending = follow_up;
             continue 'outer;
+        }
+
+        if hit_max_iterations {
+            break 'outer;
         }
 
         break;
@@ -403,7 +422,11 @@ async fn inner_run(
     )
     .await;
 
-    Ok(LoopOutcome::Done)
+    Ok(if hit_max_iterations {
+        LoopOutcome::HitMaxIterations
+    } else {
+        LoopOutcome::Done
+    })
 }
 
 async fn collect_steering(config: &LoopConfig) -> Vec<AgentMessage> {
@@ -1694,6 +1717,85 @@ mod tests {
     /// — the test asserts the loop never re-enters the LLM.
     struct TerminatorOnlyStream {
         calls: AtomicUsize,
+    }
+
+    struct RepeatingToolStream {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for RepeatingToolStream {
+        async fn stream(
+            &self,
+            _request: StreamRequest,
+            _signal: CancellationToken,
+        ) -> BoxStream<'static, StreamEvent> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let partial = empty_assistant_message();
+            let assistant = tool_call_assistant_message("continue", format!("tc-{call}"));
+            Box::pin(stream::iter(vec![
+                StreamEvent::Start { partial },
+                StreamEvent::Done { message: assistant },
+            ]))
+        }
+    }
+
+    struct NonTerminatingTool;
+
+    #[async_trait::async_trait]
+    impl crate::tool::AgentTool for NonTerminatingTool {
+        fn name(&self) -> &str {
+            "continue"
+        }
+
+        fn description(&self) -> &str {
+            "keep working"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _call_id: &str,
+            _args: serde_json::Value,
+            _signal: CancellationToken,
+            _update: tokio::sync::mpsc::UnboundedSender<crate::tool::ToolResult>,
+        ) -> Result<crate::tool::ToolResult, crate::error::ToolError> {
+            Ok(crate::tool::ToolResult::text("continue"))
+        }
+    }
+
+    #[tokio::test]
+    async fn max_iterations_stops_a_nonterminating_tool_loop() {
+        let stream = Arc::new(RepeatingToolStream {
+            calls: AtomicUsize::new(0),
+        });
+        let tools = crate::tool::ToolRegistry::new().with(Arc::new(NonTerminatingTool));
+        let config = AgentBuilder::new()
+            .stream(stream.clone())
+            .tools(tools)
+            .max_iterations(3)
+            .build()
+            .expect("config builds");
+        let prompts = vec![AgentMessage::User {
+            content: UserContent::Text("work".to_string()),
+            timestamp: None,
+        }];
+
+        let result = run(
+            prompts,
+            AgentContext::new("system"),
+            &config,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("iteration cap is a typed outcome");
+
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(result.outcome, LoopOutcome::HitMaxIterations);
+        assert!(!result.outcome.is_complete());
     }
 
     impl Default for TerminatorOnlyStream {

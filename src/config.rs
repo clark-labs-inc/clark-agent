@@ -95,6 +95,11 @@ pub struct LoopConfig {
     /// `Value::Null`.
     pub provider_extras: Option<Value>,
 
+    /// Hard ceiling on model iterations within a single `run`. Prevents a
+    /// malformed tool-call/recovery cycle from consuming unbounded provider
+    /// requests. `None` leaves lifetime control to the caller.
+    pub max_iterations: Option<usize>,
+
     /// Recovery for a provider context-window rejection mid-run. When
     /// `Some`, a [`crate::StreamError::ContextOverflow`] triggers the
     /// hook (typically an aggressive compaction), the shrunk history is
@@ -167,6 +172,7 @@ pub struct AgentBuilder {
     max_output_tokens: Option<u32>,
     reasoning: ReasoningEffort,
     provider_extras: Option<Value>,
+    max_iterations: Option<usize>,
     overflow_recovery: Option<Arc<dyn ContextOverflowRecovery>>,
     plain_text_terminal_fallback_tool: Option<String>,
     plain_text_terminal_fallback_eager: bool,
@@ -196,6 +202,7 @@ impl AgentBuilder {
             max_output_tokens: None,
             reasoning: ReasoningEffort::default(),
             provider_extras: None,
+            max_iterations: None,
             overflow_recovery: None,
             plain_text_terminal_fallback_tool: None,
             plain_text_terminal_fallback_eager: false,
@@ -246,6 +253,12 @@ impl AgentBuilder {
 
     pub fn max_output_tokens(mut self, t: u32) -> Self {
         self.max_output_tokens = Some(t);
+        self
+    }
+
+    /// Set a hard ceiling on model iterations for one run.
+    pub fn max_iterations(mut self, n: usize) -> Self {
+        self.max_iterations = Some(n.max(1));
         self
     }
 
@@ -488,6 +501,7 @@ impl AgentBuilder {
             max_output_tokens: self.max_output_tokens,
             reasoning: self.reasoning,
             provider_extras: self.provider_extras,
+            max_iterations: self.max_iterations,
             overflow_recovery: self.overflow_recovery,
             plain_text_terminal_fallback_tool: self.plain_text_terminal_fallback_tool,
             plain_text_terminal_fallback_eager: self.plain_text_terminal_fallback_eager,
@@ -745,5 +759,19 @@ mod child_builder_tests {
         assert_eq!(child.max_output_tokens, Some(8192));
         assert_eq!(child.max_tool_calls_per_turn, Some(3));
         assert_eq!(child.model_id.as_deref(), Some("test-model"));
+    }
+
+    #[test]
+    fn child_builder_gets_an_independent_iteration_budget() {
+        let parent = AgentBuilder::new()
+            .stream(Arc::new(EmptyStream))
+            .max_iterations(30)
+            .build()
+            .expect("parent builds");
+
+        let child = parent.child_builder().build().expect("child builds");
+
+        assert_eq!(parent.max_iterations, Some(30));
+        assert_eq!(child.max_iterations, None);
     }
 }
