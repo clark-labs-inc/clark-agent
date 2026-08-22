@@ -157,11 +157,18 @@ pub struct BeforeToolCallContext<'a> {
 /// `block: true` short-circuits execution; the loop synthesizes an error
 /// tool result with `reason` (or a default message) and emits a
 /// `ToolExecutionEnd` with `is_error = true`.
+///
+/// `replacement_args` is a narrow normalization boundary for facts already
+/// proven by typed history. It lets a plugin carry transcript-owned metadata
+/// (for example, an evidenced delivery receipt) into execution without asking
+/// the model to copy the same value into another JSON shape. The loop validates
+/// replacement arguments before execution and passes them to later hooks.
 #[derive(Debug, Clone, Default)]
 pub struct BeforeToolDecision {
     pub block: bool,
     pub reason: Option<String>,
     pub details: Option<Value>,
+    pub replacement_args: Option<Value>,
 }
 
 impl BeforeToolDecision {
@@ -173,6 +180,7 @@ impl BeforeToolDecision {
             block: true,
             reason: Some(reason.into()),
             details: None,
+            replacement_args: None,
         }
     }
 
@@ -181,6 +189,16 @@ impl BeforeToolDecision {
             block: true,
             reason: Some(reason.into()),
             details: Some(details),
+            replacement_args: None,
+        }
+    }
+
+    /// Continue with normalized arguments derived from typed runtime context.
+    /// The replacement is revalidated before execution.
+    pub fn allow_with_args(args: Value) -> Self {
+        Self {
+            replacement_args: Some(args),
+            ..Self::default()
         }
     }
 }

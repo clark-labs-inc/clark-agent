@@ -240,6 +240,27 @@ impl Plugin for BlockBananas {
         PluginCapabilities::before_tool_call()
     }
 }
+
+struct AttachEvidence;
+impl Plugin for AttachEvidence {
+    fn name(&self) -> &'static str {
+        "attach_evidence"
+    }
+    fn capabilities(&self) -> PluginCapabilities {
+        PluginCapabilities::before_tool_call()
+    }
+}
+#[async_trait]
+impl BeforeToolCall for AttachEvidence {
+    async fn on_before_tool_call(
+        &self,
+        ctx: clark_agent::plugin::BeforeToolCallContext<'_>,
+    ) -> BeforeToolDecision {
+        let mut args = ctx.args.clone();
+        args["text"] = Value::String("evidenced delivery".into());
+        BeforeToolDecision::allow_with_args(args)
+    }
+}
 #[async_trait]
 impl BeforeToolCall for BlockBananas {
     async fn on_before_tool_call(
@@ -498,6 +519,57 @@ async fn before_hook_blocks_tool_call() {
         event,
         AgentEvent::ToolExecutionEnd { tool_call_id, is_error: true, .. } if tool_call_id == "c1"
     )));
+}
+
+#[tokio::test]
+async fn before_hook_can_normalize_arguments_before_execution() {
+    let turn1 = AgentMessage::Assistant {
+        content: AssistantContent {
+            blocks: vec![AssistantBlock::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"text": "model payload"}),
+            })],
+        },
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        timestamp: None,
+        usage: None,
+    };
+    let turn2 = AgentMessage::Assistant {
+        content: AssistantContent::text("done"),
+        stop_reason: StopReason::EndTurn,
+        error_message: None,
+        timestamp: None,
+        usage: None,
+    };
+    let config = AgentBuilder::new()
+        .stream(Arc::new(ScriptedStream::new(vec![turn1, turn2])))
+        .tools(ToolRegistry::new().with(Arc::new(EchoTool)))
+        .before_tool_call(AttachEvidence)
+        .build()
+        .unwrap();
+
+    let messages = clark_agent::run(
+        vec![AgentMessage::User {
+            content: UserContent::Text("go".into()),
+            timestamp: None,
+        }],
+        AgentContext::new("test"),
+        &config,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .messages;
+
+    let AgentMessage::ToolResult { content, .. } = &messages[2] else {
+        panic!("expected tool result");
+    };
+    let ToolResultBlock::Text(text) = &content.blocks[0] else {
+        panic!("expected text result");
+    };
+    assert_eq!(text.text, "evidenced delivery");
 }
 
 #[tokio::test]

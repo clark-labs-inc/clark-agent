@@ -14,8 +14,9 @@
 //!
 //! Hook plumbing:
 //! - `BeforeToolCall::on_before_tool_call` runs after argument validation,
-//!   before `tool.execute`. May `block` to short-circuit with an error
-//!   tool result.
+//!   before `tool.execute`. It may `block` to short-circuit with an error
+//!   tool result or return revalidated replacement arguments derived from
+//!   typed runtime context.
 //! - `AfterToolCall::on_after_tool_call` runs after `tool.execute`. May
 //!   `override_result`, `mark_error`, or vote `terminate`.
 
@@ -919,7 +920,7 @@ async fn prepare_call(
         });
     }
 
-    let prepared_args = tool.prepare_arguments(call.arguments.clone());
+    let mut prepared_args = tool.prepare_arguments(call.arguments.clone());
 
     if let Err(err) = tool.validate(&prepared_args) {
         return PreparedCall::Immediate(ExecutedOutcome {
@@ -928,21 +929,14 @@ async fn prepare_call(
         });
     }
 
-    let ctx = BeforeToolCallContext {
-        assistant_message: assistant,
-        assistant_content,
-        tool_call: call,
-        args: &prepared_args,
-        messages: &context.messages,
-    };
     for hook in &config.plugins.before_tool_call {
         let decision = hook
             .on_before_tool_call(BeforeToolCallContext {
-                assistant_message: ctx.assistant_message,
-                assistant_content: ctx.assistant_content,
-                tool_call: ctx.tool_call,
-                args: ctx.args,
-                messages: ctx.messages,
+                assistant_message: assistant,
+                assistant_content,
+                tool_call: call,
+                args: &prepared_args,
+                messages: &context.messages,
             })
             .await;
         if decision.block {
@@ -957,6 +951,21 @@ async fn prepare_call(
                 result,
                 is_error: true,
             });
+        }
+        if let Some(replacement_args) = decision.replacement_args {
+            if let Err(err) = tool.validate(&replacement_args) {
+                return PreparedCall::Immediate(ExecutedOutcome {
+                    result: ToolResult::argument_validation_error(
+                        &call.name,
+                        format!(
+                            "{} returned invalid replacement arguments: {err}",
+                            hook.name()
+                        ),
+                    ),
+                    is_error: true,
+                });
+            }
+            prepared_args = replacement_args;
         }
     }
 
