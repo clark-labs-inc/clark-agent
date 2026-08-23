@@ -39,6 +39,14 @@ const EMPTY_STREAM_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duratio
 const ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY: std::time::Duration =
     std::time::Duration::from_millis(500);
 const PROVIDER_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+/// A `StreamFn` owns its bounded wire retries. If it still returns a provider
+/// rate limit, the canonical loop may retry the whole provider call only
+/// within both of these hard ceilings. Counting the initial rejected call
+/// makes the attempt limit unambiguous and prevents `max_iterations` from
+/// being bypassed before an assistant turn exists.
+const PROVIDER_RATE_LIMIT_OUTER_MAX_ATTEMPTS: u32 = 3;
+const PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED: std::time::Duration =
+    std::time::Duration::from_secs(120);
 const ZERO_OUTPUT_TRANSPORT_RECOVERY_CONTEXT: &str = "\
 [runtime context — transport recovery, not user instruction]\n\
 The previous provider attempt produced no actionable output: no visible assistant text and no usable tool call reached the runtime. \
@@ -599,21 +607,48 @@ async fn stream_with_max_tokens_recovery(
     let mut empty_stream_attempts: u32 = 0;
     let mut zero_output_transport_attempts: u32 = 0;
     let mut transient_stream_attempts: u32 = 0;
+    let mut provider_rate_limit_attempts: u32 = 0;
+    let mut provider_rate_limit_started_at: Option<tokio::time::Instant> = None;
+    let mut last_provider_rate_limit_message: Option<String> = None;
     let mut zero_output_recovery_context: Option<AgentContext> = None;
     let mut reasoning = config.reasoning;
 
     loop {
         let attempt_context = zero_output_recovery_context.as_ref().unwrap_or(context);
-        let (assistant, allowlist) = match stream_assistant_response(
+        let stream_attempt = stream_assistant_response(
             attempt_context,
             config,
             signal,
             iteration,
             current_cap,
             reasoning,
-        )
-        .await
-        {
+        );
+        let stream_result = if let Some(started_at) = provider_rate_limit_started_at {
+            let elapsed = started_at.elapsed();
+            let remaining = PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED.saturating_sub(elapsed);
+            if remaining.is_zero() {
+                return Err(LoopError::Stream(StreamError::ProviderRateLimited(
+                    last_provider_rate_limit_message
+                        .unwrap_or_else(|| "provider rate-limit retry elapsed ceiling reached".into()),
+                )));
+            }
+            tokio::select! {
+                _ = signal.cancelled() => return Err(LoopError::Aborted),
+                result = tokio::time::timeout(remaining, stream_attempt) => match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return Err(LoopError::Stream(StreamError::ProviderRateLimited(
+                            last_provider_rate_limit_message.unwrap_or_else(|| {
+                                "provider rate-limit retry elapsed ceiling reached".into()
+                            }),
+                        )));
+                    }
+                }
+            }
+        } else {
+            stream_attempt.await
+        };
+        let (assistant, allowlist) = match stream_result {
             Ok(pair) => pair,
             Err(LoopError::Stream(StreamError::Empty)) => {
                 empty_stream_attempts = empty_stream_attempts.saturating_add(1);
@@ -640,9 +675,36 @@ async fn stream_with_max_tokens_recovery(
                 }
                 continue;
             }
-            Err(LoopError::Stream(
-                StreamError::Transient(_) | StreamError::ProviderRateLimited(_),
-            )) => {
+            Err(LoopError::Stream(StreamError::ProviderRateLimited(message))) => {
+                provider_rate_limit_attempts = provider_rate_limit_attempts.saturating_add(1);
+                let started_at = *provider_rate_limit_started_at
+                    .get_or_insert_with(tokio::time::Instant::now);
+                last_provider_rate_limit_message = Some(message.clone());
+                let elapsed = started_at.elapsed();
+                if provider_rate_limit_attempts >= PROVIDER_RATE_LIMIT_OUTER_MAX_ATTEMPTS
+                    || elapsed >= PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED
+                {
+                    return Err(LoopError::Stream(StreamError::ProviderRateLimited(message)));
+                }
+                let remaining = PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED.saturating_sub(elapsed);
+                let delay = provider_retry_delay(
+                    ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
+                    provider_rate_limit_attempts,
+                );
+                if delay >= remaining {
+                    tokio::select! {
+                        _ = signal.cancelled() => return Err(LoopError::Aborted),
+                        _ = tokio::time::sleep(remaining) => {}
+                    }
+                    return Err(LoopError::Stream(StreamError::ProviderRateLimited(message)));
+                }
+                tokio::select! {
+                    _ = signal.cancelled() => return Err(LoopError::Aborted),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                continue;
+            }
+            Err(LoopError::Stream(StreamError::Transient(_))) => {
                 transient_stream_attempts = transient_stream_attempts.saturating_add(1);
                 let delay = provider_retry_delay(
                     ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
@@ -1206,6 +1268,27 @@ mod tests {
         failures_before_success: usize,
     }
 
+    struct ProviderRateLimitedStream {
+        calls: AtomicUsize,
+        stall_after_first: bool,
+    }
+
+    impl ProviderRateLimitedStream {
+        fn immediate() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                stall_after_first: false,
+            }
+        }
+
+        fn then_stall() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                stall_after_first: true,
+            }
+        }
+    }
+
     impl EmptyThenTextStream {
         fn new(failures_before_success: usize) -> Self {
             Self {
@@ -1377,6 +1460,31 @@ mod tests {
                 StreamEvent::Start { partial },
                 StreamEvent::Done {
                     message: text_assistant_message("recovered"),
+                },
+            ]))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for ProviderRateLimitedStream {
+        async fn stream(
+            &self,
+            _request: StreamRequest,
+            _signal: CancellationToken,
+        ) -> BoxStream<'static, StreamEvent> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.stall_after_first && call > 0 {
+                return Box::pin(stream::pending());
+            }
+            let partial = empty_assistant_message();
+            Box::pin(stream::iter(vec![
+                StreamEvent::Start {
+                    partial: partial.clone(),
+                },
+                StreamEvent::Error {
+                    partial,
+                    kind: StreamErrorKind::ProviderRateLimited,
+                    message: "upstream provider shared pool is rate limited".to_string(),
                 },
             ]))
         }
@@ -1662,6 +1770,61 @@ mod tests {
         };
         assert_eq!(content.plain_text(), "recovered");
         assert_eq!(stream.calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_rate_limit_outer_retry_has_a_hard_attempt_ceiling() {
+        let stream = Arc::new(ProviderRateLimitedStream::immediate());
+        let config = AgentBuilder::new()
+            .stream(stream.clone())
+            .model_id("test-model")
+            .build()
+            .expect("config builds");
+        let context = AgentContext::new("system").with_messages(vec![AgentMessage::User {
+            content: UserContent::Text("continue".to_string()),
+            timestamp: None,
+        }]);
+
+        let result =
+            stream_with_max_tokens_recovery(&context, &config, &CancellationToken::new(), 0)
+                .await;
+
+        assert!(matches!(
+            result,
+            Err(LoopError::Stream(StreamError::ProviderRateLimited(message)))
+                if message.contains("shared pool")
+        ));
+        assert_eq!(
+            stream.calls.load(Ordering::SeqCst),
+            PROVIDER_RATE_LIMIT_OUTER_MAX_ATTEMPTS as usize
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_rate_limit_outer_retry_has_a_hard_elapsed_ceiling() {
+        let stream = Arc::new(ProviderRateLimitedStream::then_stall());
+        let config = AgentBuilder::new()
+            .stream(stream.clone())
+            .model_id("test-model")
+            .build()
+            .expect("config builds");
+        let context = AgentContext::new("system").with_messages(vec![AgentMessage::User {
+            content: UserContent::Text("continue".to_string()),
+            timestamp: None,
+        }]);
+        let started_at = tokio::time::Instant::now();
+
+        let result =
+            stream_with_max_tokens_recovery(&context, &config, &CancellationToken::new(), 0)
+                .await;
+
+        assert!(matches!(
+            result,
+            Err(LoopError::Stream(StreamError::ProviderRateLimited(message)))
+                if message.contains("shared pool")
+        ));
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(started_at.elapsed(), PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED);
     }
 
     #[tokio::test]
