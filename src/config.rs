@@ -71,7 +71,8 @@ pub struct LoopConfig {
     pub default_execution_mode: ExecutionMode,
 
     /// Optional hard cap on limit-counted tool calls executed from a
-    /// single assistant turn. When set to `1`, the loop preserves every
+    /// single assistant turn, including reads, searches, and browser calls.
+    /// Execution concurrency is configured separately. When set to `1`, the loop preserves every
     /// emitted tool call in the assistant message, executes the first
     /// limit-counted call plus any zero-weight progress signals, appends
     /// synthetic error results for the rest, then asks the model to choose

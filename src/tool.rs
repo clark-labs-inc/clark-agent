@@ -342,21 +342,6 @@ pub trait AgentTool: Send + Sync + 'static {
         true
     }
 
-    /// Whether this tool is safe to invoke multiple times in a single
-    /// assistant turn alongside other tool calls.
-    ///
-    /// Default `false`: tools serialize at the configured cap so writes
-    /// and stateful operations stay sequenced. Read-only / idempotent
-    /// tools (web search, file read, grep, glob, snapshots) override to
-    /// `true` so a provider that batches several independent lookups in
-    /// one turn does not get N-1 of them rejected with a "only the first
-    /// call can run" error. Parallel-safe tools still execute one at a
-    /// time on the runtime side; they just do not contend for the
-    /// per-turn cap.
-    fn parallel_safe_per_turn(&self) -> bool {
-        false
-    }
-
     /// Whether this tool's `terminate` vote is included in the
     /// unanimous-vote tally that decides whether the batch ends the
     /// run.
@@ -470,13 +455,6 @@ pub trait TypedAgentTool: Send + Sync + 'static {
         true
     }
 
-    /// Whether this tool is safe to invoke multiple times in a single
-    /// assistant turn alongside other tool calls. Default `false`. See
-    /// the corresponding `AgentTool::parallel_safe_per_turn` docstring.
-    fn parallel_safe_per_turn(&self) -> bool {
-        false
-    }
-
     /// Whether this tool's `terminate` vote counts in the
     /// unanimous-vote tally. Default `true`. Status-only progress
     /// tools opt out by returning `false`; see the corresponding
@@ -556,10 +534,6 @@ impl<T: TypedAgentTool> AgentTool for T {
 
     fn counts_toward_tool_call_limit(&self) -> bool {
         TypedAgentTool::counts_toward_tool_call_limit(self)
-    }
-
-    fn parallel_safe_per_turn(&self) -> bool {
-        TypedAgentTool::parallel_safe_per_turn(self)
     }
 
     fn counts_toward_termination_vote(&self) -> bool {
