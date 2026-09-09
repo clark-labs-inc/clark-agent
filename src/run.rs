@@ -228,10 +228,7 @@ async fn inner_run(
             if signal.is_cancelled() {
                 return Err(LoopError::Aborted);
             }
-            if config
-                .max_iterations
-                .is_some_and(|max| iterations >= max)
-            {
+            if config.max_iterations.is_some_and(|max| iterations >= max) {
                 hit_max_iterations = true;
                 break;
             }
@@ -628,8 +625,9 @@ async fn stream_with_max_tokens_recovery(
             let remaining = PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED.saturating_sub(elapsed);
             if remaining.is_zero() {
                 return Err(LoopError::Stream(StreamError::ProviderRateLimited(
-                    last_provider_rate_limit_message
-                        .unwrap_or_else(|| "provider rate-limit retry elapsed ceiling reached".into()),
+                    last_provider_rate_limit_message.unwrap_or_else(|| {
+                        "provider rate-limit retry elapsed ceiling reached".into()
+                    }),
                 )));
             }
             tokio::select! {
@@ -677,8 +675,8 @@ async fn stream_with_max_tokens_recovery(
             }
             Err(LoopError::Stream(StreamError::ProviderRateLimited(message))) => {
                 provider_rate_limit_attempts = provider_rate_limit_attempts.saturating_add(1);
-                let started_at = *provider_rate_limit_started_at
-                    .get_or_insert_with(tokio::time::Instant::now);
+                let started_at =
+                    *provider_rate_limit_started_at.get_or_insert_with(tokio::time::Instant::now);
                 last_provider_rate_limit_message = Some(message.clone());
                 let elapsed = started_at.elapsed();
                 if provider_rate_limit_attempts >= PROVIDER_RATE_LIMIT_OUTER_MAX_ATTEMPTS
@@ -1786,8 +1784,7 @@ mod tests {
         }]);
 
         let result =
-            stream_with_max_tokens_recovery(&context, &config, &CancellationToken::new(), 0)
-                .await;
+            stream_with_max_tokens_recovery(&context, &config, &CancellationToken::new(), 0).await;
 
         assert!(matches!(
             result,
@@ -1815,8 +1812,7 @@ mod tests {
         let started_at = tokio::time::Instant::now();
 
         let result =
-            stream_with_max_tokens_recovery(&context, &config, &CancellationToken::new(), 0)
-                .await;
+            stream_with_max_tokens_recovery(&context, &config, &CancellationToken::new(), 0).await;
 
         assert!(matches!(
             result,

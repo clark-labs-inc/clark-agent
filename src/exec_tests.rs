@@ -167,11 +167,8 @@ fn malformed_calls_do_not_burn_the_cap_or_preempt_real_work() {
     let registry = registry();
 
     // Unknown name first, real counting tool second: both run; nothing deferred.
-    let (executable, unexecuted, _) = split_tool_calls_for_execution(
-        vec![call("missing"), call("shell")],
-        &registry,
-        Some(1),
-    );
+    let (executable, unexecuted, _) =
+        split_tool_calls_for_execution(vec![call("missing"), call("shell")], &registry, Some(1));
     assert_eq!(names(&executable), vec!["missing", "shell"]);
     assert!(
         unexecuted.is_empty(),
