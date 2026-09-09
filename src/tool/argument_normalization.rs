@@ -190,4 +190,3 @@ pub(super) fn strip_top_level_nulls(value: Value) -> Value {
         other => other,
     }
 }
-

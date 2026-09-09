@@ -4,7 +4,6 @@ use super::*;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
@@ -330,8 +329,7 @@ fn coerce_skips_ambiguous_multi_type_schemas() {
     let schema = make_schema(serde_json::json!({
         "value": {"type": ["integer", "string"]},
     }));
-    let coerced =
-        coerce_string_scalars_at_top_level(serde_json::json!({"value": "42"}), &schema);
+    let coerced = coerce_string_scalars_at_top_level(serde_json::json!({"value": "42"}), &schema);
     assert_eq!(coerced, serde_json::json!({"value": "42"}));
 }
 
@@ -427,4 +425,3 @@ fn typed_schema_preserves_single_struct_contract() {
     assert_eq!(schema["additionalProperties"], false);
     assert!(schema.get("oneOf").is_none());
 }
-

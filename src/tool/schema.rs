@@ -45,4 +45,3 @@ pub(super) fn normalize_strict_validator_quirks(value: &mut Value) {
         _ => {}
     }
 }
-
