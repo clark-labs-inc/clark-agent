@@ -133,9 +133,15 @@ struct ReadTool {
 
 #[async_trait]
 impl AgentTool for ReadTool {
-    fn name(&self) -> &str { "file_read" }
-    fn description(&self) -> &str { "Read a file" }
-    fn parameters_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+    fn name(&self) -> &str {
+        "file_read"
+    }
+    fn description(&self) -> &str {
+        "Read a file"
+    }
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({"type": "object"})
+    }
     async fn execute(
         &self,
         _id: &str,
@@ -152,14 +158,21 @@ impl AgentTool for ReadTool {
 async fn oversized_read_batch_preserves_every_call_and_returns_excess_as_errors() {
     let count = 904;
     let limit = 8;
-    for mode in [clark_agent::ExecutionMode::Sequential, clark_agent::ExecutionMode::Parallel] {
+    for mode in [
+        clark_agent::ExecutionMode::Sequential,
+        clark_agent::ExecutionMode::Parallel,
+    ] {
         let assistant = AgentMessage::Assistant {
             content: AssistantContent {
-                blocks: (0..count).map(|i| AssistantBlock::ToolCall(ToolCall {
-                    id: format!("read-{i}"),
-                    name: "file_read".into(),
-                    arguments: serde_json::json!({}),
-                })).collect(),
+                blocks: (0..count)
+                    .map(|i| {
+                        AssistantBlock::ToolCall(ToolCall {
+                            id: format!("read-{i}"),
+                            name: "file_read".into(),
+                            arguments: serde_json::json!({}),
+                        })
+                    })
+                    .collect(),
             },
             stop_reason: StopReason::ToolUse,
             error_message: None,
@@ -176,31 +189,55 @@ async fn oversized_read_batch_preserves_every_call_and_returns_excess_as_errors(
         let calls = Arc::new(AtomicUsize::new(0));
         let config = AgentBuilder::new()
             .stream(Arc::new(ScriptedStream::new(vec![assistant, done])))
-            .tools(ToolRegistry::new().with(Arc::new(ReadTool { calls: calls.clone() })))
+            .tools(ToolRegistry::new().with(Arc::new(ReadTool {
+                calls: calls.clone(),
+            })))
             .default_execution_mode(mode)
             .max_tool_calls_per_turn(limit)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let messages = clark_agent::run(
-            vec![AgentMessage::User { content: UserContent::Text("read".into()), timestamp: None }],
+            vec![AgentMessage::User {
+                content: UserContent::Text("read".into()),
+                timestamp: None,
+            }],
             AgentContext::new("batch-budget"),
             &config,
             CancellationToken::new(),
-        ).await.unwrap().messages;
+        )
+        .await
+        .unwrap()
+        .messages;
         assert_eq!(calls.load(Ordering::SeqCst), limit);
-        let AgentMessage::Assistant { content, .. } = &messages[1] else { panic!("assistant missing") };
+        let AgentMessage::Assistant { content, .. } = &messages[1] else {
+            panic!("assistant missing")
+        };
         assert_eq!(content.tool_calls().len(), count);
-        let results: Vec<_> = messages.iter().filter_map(|message| match message {
-            AgentMessage::ToolResult { tool_call_id, is_error, content, .. } => Some((tool_call_id, is_error, content)),
-            _ => None,
-        }).collect();
+        let results: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::ToolResult {
+                    tool_call_id,
+                    is_error,
+                    content,
+                    ..
+                } => Some((tool_call_id, is_error, content)),
+                _ => None,
+            })
+            .collect();
         assert_eq!(results.len(), count);
         for i in 0..count {
-            let matching: Vec<_> = results.iter().filter(|(id, _, _)| **id == format!("read-{i}")).collect();
+            let matching: Vec<_> = results
+                .iter()
+                .filter(|(id, _, _)| **id == format!("read-{i}"))
+                .collect();
             assert_eq!(matching.len(), 1);
             let (_, is_error, content) = matching[0];
             assert_eq!(**is_error, i >= limit);
             if i >= limit {
-                let ToolResultBlock::Text(text) = &content.blocks[0] else { panic!("error text missing") };
+                let ToolResultBlock::Text(text) = &content.blocks[0] else {
+                    panic!("error text missing")
+                };
                 assert!(text.text.contains("not executed"));
                 assert!(text.text.contains("first 8"));
             }

@@ -136,7 +136,13 @@ fn extra_limit_counted_tools_still_get_synthetic_errors() {
 #[test]
 fn read_search_and_browser_calls_share_the_work_budget() {
     let registry = registry();
-    for name in ["file_read", "web_search", "browser_navigate", "browser_capture", "browser_inspect"] {
+    for name in [
+        "file_read",
+        "web_search",
+        "browser_navigate",
+        "browser_capture",
+        "browser_inspect",
+    ] {
         let (executable, unexecuted, max) = split_tool_calls_for_execution(
             vec![call(name), call(name), call("shell")],
             &registry,
