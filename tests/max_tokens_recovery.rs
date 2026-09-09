@@ -250,11 +250,7 @@ async fn truncation_and_transport_errors_share_one_attempt_budget() {
         *stop_reason = StopReason::Error;
         *error_message = Some("original upstream error".into());
     }
-    let scripted = ScriptedStream::new(vec![
-        truncated_assistant(),
-        truncated_assistant(),
-        error,
-    ]);
+    let scripted = ScriptedStream::new(vec![truncated_assistant(), truncated_assistant(), error]);
     let config = AgentBuilder::new()
         .stream(scripted.clone() as Arc<dyn StreamFn>)
         .max_output_tokens(4096)

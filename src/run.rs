@@ -579,7 +579,6 @@ async fn stream_with_overflow_recovery(
     }
 }
 
-
 async fn stream_assistant_response(
     context: &AgentContext,
     config: &LoopConfig,
@@ -1607,7 +1606,10 @@ mod tests {
                 if message.contains("shared pool")
         ));
         assert_eq!(stream.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(started_at.elapsed(), provider_recovery::PROVIDER_RECOVERY_MAX_ELAPSED);
+        assert_eq!(
+            started_at.elapsed(),
+            provider_recovery::PROVIDER_RECOVERY_MAX_ELAPSED
+        );
     }
 
     #[tokio::test]

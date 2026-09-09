@@ -76,14 +76,13 @@ pub(super) async fn stream_with_max_tokens_recovery(
                     zero_output_recovery_context =
                         Some(context_with_zero_output_transport_recovery(context));
                 }
-                let delay = std::time::Duration::from_millis(
-                    if matches!(&error, StreamError::Empty) {
+                let delay =
+                    std::time::Duration::from_millis(if matches!(&error, StreamError::Empty) {
                         250
                     } else {
                         500
-                    },
-                )
-                .saturating_mul(attempts);
+                    })
+                    .saturating_mul(attempts);
                 let remaining = PROVIDER_RECOVERY_MAX_ELAPSED.saturating_sub(started_at.elapsed());
                 if delay >= remaining {
                     return Err(LoopError::Stream(error));

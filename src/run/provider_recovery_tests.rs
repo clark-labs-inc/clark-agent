@@ -14,7 +14,11 @@ struct FailingStream {
 
 #[async_trait::async_trait]
 impl StreamFn for FailingStream {
-    async fn stream(&self, _: StreamRequest, _: CancellationToken) -> BoxStream<'static, StreamEvent> {
+    async fn stream(
+        &self,
+        _: StreamRequest,
+        _: CancellationToken,
+    ) -> BoxStream<'static, StreamEvent> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         let partial = AgentMessage::Assistant {
             content: AssistantContent::text(""),
@@ -120,7 +124,9 @@ async fn error_stop_cannot_bypass_the_transport_budget() {
         0,
     )
     .await;
-    assert!(matches!(result, Err(LoopError::Stream(StreamError::Transient(message)))
-        if message == "original provider failure"));
+    assert!(
+        matches!(result, Err(LoopError::Stream(StreamError::Transient(message)))
+        if message == "original provider failure")
+    );
     assert_eq!(stream.calls.load(Ordering::SeqCst), 3);
 }
