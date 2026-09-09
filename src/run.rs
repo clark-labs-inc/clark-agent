@@ -35,19 +35,9 @@ use crate::types::{
     AgentContext, AgentMessage, AssistantContent, StopReason, ToolResultContent, Usage,
 };
 
-const EMPTY_STREAM_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
-const ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY: std::time::Duration =
-    std::time::Duration::from_millis(500);
-const PROVIDER_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-/// A `StreamFn` owns its bounded wire retries. If it still returns a provider
-/// rate limit, the canonical loop may retry the whole provider call only
-/// within both of these hard ceilings. Counting the initial rejected call
-/// makes the attempt limit unambiguous and prevents `max_iterations` from
-/// being bypassed before an assistant turn exists.
-const PROVIDER_RATE_LIMIT_OUTER_MAX_ATTEMPTS: u32 = 3;
-const PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED: std::time::Duration =
-    std::time::Duration::from_secs(120);
+mod provider_recovery;
 mod transport_recovery;
+use provider_recovery::stream_with_max_tokens_recovery;
 use transport_recovery::context_with_zero_output_transport_recovery;
 
 /// Outcome label for a completed run.
@@ -589,186 +579,6 @@ async fn stream_with_overflow_recovery(
     }
 }
 
-async fn stream_with_max_tokens_recovery(
-    context: &AgentContext,
-    config: &LoopConfig,
-    signal: &CancellationToken,
-    iteration: usize,
-) -> Result<(AgentMessage, Option<std::collections::HashSet<String>>), LoopError> {
-    let mut current_cap = config.max_output_tokens;
-    let mut max_tokens_attempt: u32 = 0;
-    let mut empty_stream_attempts: u32 = 0;
-    let mut zero_output_transport_attempts: u32 = 0;
-    let mut transient_stream_attempts: u32 = 0;
-    let mut provider_rate_limit_attempts: u32 = 0;
-    let mut provider_rate_limit_started_at: Option<tokio::time::Instant> = None;
-    let mut last_provider_rate_limit_message: Option<String> = None;
-    let mut zero_output_recovery_context: Option<AgentContext> = None;
-    let reasoning = config.reasoning;
-
-    loop {
-        let attempt_context = zero_output_recovery_context.as_ref().unwrap_or(context);
-        let stream_attempt = stream_assistant_response(
-            attempt_context,
-            config,
-            signal,
-            iteration,
-            current_cap,
-            reasoning,
-        );
-        let stream_result = if let Some(started_at) = provider_rate_limit_started_at {
-            let elapsed = started_at.elapsed();
-            let remaining = PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED.saturating_sub(elapsed);
-            if remaining.is_zero() {
-                return Err(LoopError::Stream(StreamError::ProviderRateLimited(
-                    last_provider_rate_limit_message.unwrap_or_else(|| {
-                        "provider rate-limit retry elapsed ceiling reached".into()
-                    }),
-                )));
-            }
-            tokio::select! {
-                _ = signal.cancelled() => return Err(LoopError::Aborted),
-                result = tokio::time::timeout(remaining, stream_attempt) => match result {
-                    Ok(result) => result,
-                    Err(_) => {
-                        return Err(LoopError::Stream(StreamError::ProviderRateLimited(
-                            last_provider_rate_limit_message.unwrap_or_else(|| {
-                                "provider rate-limit retry elapsed ceiling reached".into()
-                            }),
-                        )));
-                    }
-                }
-            }
-        } else {
-            stream_attempt.await
-        };
-        let (assistant, allowlist) = match stream_result {
-            Ok(pair) => pair,
-            Err(LoopError::Stream(StreamError::Empty)) => {
-                empty_stream_attempts = empty_stream_attempts.saturating_add(1);
-                let delay =
-                    provider_retry_delay(EMPTY_STREAM_RETRY_INITIAL_DELAY, empty_stream_attempts);
-                tokio::select! {
-                    _ = signal.cancelled() => return Err(LoopError::Aborted),
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                continue;
-            }
-            Err(LoopError::Stream(StreamError::ZeroOutputTransport(_))) => {
-                zero_output_transport_attempts = zero_output_transport_attempts.saturating_add(1);
-                zero_output_recovery_context =
-                    Some(context_with_zero_output_transport_recovery(context));
-                let delay = provider_retry_delay(
-                    ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
-                    zero_output_transport_attempts,
-                );
-                tokio::select! {
-                    _ = signal.cancelled() => return Err(LoopError::Aborted),
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                continue;
-            }
-            Err(LoopError::Stream(StreamError::ProviderRateLimited(message))) => {
-                provider_rate_limit_attempts = provider_rate_limit_attempts.saturating_add(1);
-                let started_at =
-                    *provider_rate_limit_started_at.get_or_insert_with(tokio::time::Instant::now);
-                last_provider_rate_limit_message = Some(message.clone());
-                let elapsed = started_at.elapsed();
-                if provider_rate_limit_attempts >= PROVIDER_RATE_LIMIT_OUTER_MAX_ATTEMPTS
-                    || elapsed >= PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED
-                {
-                    return Err(LoopError::Stream(StreamError::ProviderRateLimited(message)));
-                }
-                let remaining = PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED.saturating_sub(elapsed);
-                let delay = provider_retry_delay(
-                    ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
-                    provider_rate_limit_attempts,
-                );
-                if delay >= remaining {
-                    tokio::select! {
-                        _ = signal.cancelled() => return Err(LoopError::Aborted),
-                        _ = tokio::time::sleep(remaining) => {}
-                    }
-                    return Err(LoopError::Stream(StreamError::ProviderRateLimited(message)));
-                }
-                tokio::select! {
-                    _ = signal.cancelled() => return Err(LoopError::Aborted),
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                continue;
-            }
-            Err(LoopError::Stream(StreamError::Transient(_))) => {
-                transient_stream_attempts = transient_stream_attempts.saturating_add(1);
-                let delay = provider_retry_delay(
-                    ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
-                    transient_stream_attempts,
-                );
-                tokio::select! {
-                    _ = signal.cancelled() => return Err(LoopError::Aborted),
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-
-        let stop_reason = match &assistant {
-            AgentMessage::Assistant { stop_reason, .. } => *stop_reason,
-            _ => StopReason::Other,
-        };
-        if stop_reason == StopReason::Aborted {
-            return Err(LoopError::Aborted);
-        }
-        if stop_reason == StopReason::Error {
-            transient_stream_attempts = transient_stream_attempts.saturating_add(1);
-            let delay = provider_retry_delay(
-                ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
-                transient_stream_attempts,
-            );
-            tokio::select! {
-                _ = signal.cancelled() => return Err(LoopError::Aborted),
-                _ = tokio::time::sleep(delay) => {}
-            }
-            continue;
-        }
-        if stop_reason != StopReason::MaxTokens {
-            return Ok((assistant, allowlist));
-        }
-        // No starting cap means there's no number to scale from. Refuse
-        // recovery rather than guess — the deployment hadn't pinned a
-        // cap, so the truncation came from a provider-side limit we
-        // don't know how to raise.
-        let Some(prev_cap) = current_cap else {
-            return Ok((assistant, allowlist));
-        };
-        let new_cap = prev_cap.saturating_mul(2);
-        if new_cap <= prev_cap {
-            return Ok((assistant, allowlist));
-        }
-
-        max_tokens_attempt = max_tokens_attempt.saturating_add(1);
-        emit(
-            config,
-            AgentEvent::OutputTokensEscalation {
-                attempt: max_tokens_attempt,
-                prev_cap,
-                new_cap,
-            },
-        )
-        .await;
-        current_cap = Some(new_cap);
-        // Discard the truncated `assistant` by simply not pushing it
-        // into the caller's transcript. The MessageStart/MessageEnd
-        // events for it already fired from the inner streamer; the
-        // OutputTokensEscalation event above is the listener's signal
-        // to roll the previous pair back from any projection.
-    }
-}
-
-fn provider_retry_delay(base: std::time::Duration, attempt: u32) -> std::time::Duration {
-    base.saturating_mul(attempt.min(64))
-        .min(PROVIDER_RETRY_MAX_DELAY)
-}
 
 async fn stream_assistant_response(
     context: &AgentContext,
@@ -1723,8 +1533,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn empty_stream_recovery_outlives_the_legacy_three_attempt_cap() {
-        let stream = Arc::new(EmptyThenTextStream::new(4));
+    async fn empty_stream_recovers_within_the_shared_attempt_budget() {
+        let stream = Arc::new(EmptyThenTextStream::new(2));
         let config = AgentBuilder::new()
             .stream(stream.clone())
             .model_id("test-model")
@@ -1738,13 +1548,13 @@ mod tests {
         let (assistant, _allowlist) =
             stream_with_max_tokens_recovery(&context, &config, &CancellationToken::new(), 0)
                 .await
-                .expect("fifth stream attempt should recover");
+                .expect("third stream attempt should recover");
 
         let AgentMessage::Assistant { content, .. } = assistant else {
             panic!("expected assistant response");
         };
         assert_eq!(content.plain_text(), "recovered");
-        assert_eq!(stream.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1770,7 +1580,7 @@ mod tests {
         ));
         assert_eq!(
             stream.calls.load(Ordering::SeqCst),
-            PROVIDER_RATE_LIMIT_OUTER_MAX_ATTEMPTS as usize
+            provider_recovery::PROVIDER_RECOVERY_MAX_ATTEMPTS as usize
         );
     }
 
@@ -1797,7 +1607,7 @@ mod tests {
                 if message.contains("shared pool")
         ));
         assert_eq!(stream.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(started_at.elapsed(), PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED);
+        assert_eq!(started_at.elapsed(), provider_recovery::PROVIDER_RECOVERY_MAX_ELAPSED);
     }
 
     #[tokio::test]

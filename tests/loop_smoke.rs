@@ -679,7 +679,7 @@ async fn execution_tool_error_remains_context_event() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn transient_stream_error_retries_until_cancelled() {
+async fn cancellation_interrupts_transient_recovery_delay() {
     let stream = Arc::new(EventScriptedStream::new(vec![StreamEvent::Error {
         partial: empty_assistant(StopReason::Other, None),
         kind: StreamErrorKind::Transient,
@@ -690,7 +690,7 @@ async fn transient_stream_error_retries_until_cancelled() {
     let signal = CancellationToken::new();
     let cancel = signal.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         cancel.cancel();
     });
 
@@ -766,14 +766,14 @@ async fn aborted_stream_error_emits_aborted_message_end() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn empty_stream_retries_until_cancelled() {
+async fn cancellation_interrupts_empty_stream_recovery_delay() {
     let stream = Arc::new(EventScriptedStream::new(Vec::new()));
     let config = AgentBuilder::new().stream(stream).build().unwrap();
 
     let signal = CancellationToken::new();
     let cancel = signal.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         cancel.cancel();
     });
 

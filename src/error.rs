@@ -41,12 +41,12 @@ pub enum LoopError {
 #[derive(Debug, Error)]
 pub enum StreamError {
     /// Transient failure: rate limit, network blip, retryable provider
-    /// error. The loop retries these until caller cancellation.
+    /// error. The loop retries within its shared attempt and elapsed ceilings.
     #[error("transient stream error: {0}")]
     Transient(String),
 
     /// The selected model/provider is temporarily rate-limited. The
-    /// loop retries until the provider recovers or the caller cancels.
+    /// loop applies the same bounded recovery budget as other transport errors.
     #[error("provider rate-limited request: {0}")]
     ProviderRateLimited(String),
 
