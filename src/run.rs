@@ -47,12 +47,8 @@ const PROVIDER_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_
 const PROVIDER_RATE_LIMIT_OUTER_MAX_ATTEMPTS: u32 = 3;
 const PROVIDER_RATE_LIMIT_OUTER_MAX_ELAPSED: std::time::Duration =
     std::time::Duration::from_secs(120);
-const ZERO_OUTPUT_TRANSPORT_RECOVERY_CONTEXT: &str = "\
-[runtime context — transport recovery, not user instruction]\n\
-The previous provider attempt produced no actionable output: no visible assistant text and no usable tool call reached the runtime. \
-It may have produced private-only reasoning or an unusable burst of partial tool calls. \
-Do not continue with private reasoning only. Re-read the latest observation and immediately choose exactly one next structured tool call; \
-if the answer is ready, use the final response tool.";
+mod transport_recovery;
+use transport_recovery::context_with_zero_output_transport_recovery;
 
 /// Outcome label for a completed run.
 ///
@@ -608,7 +604,7 @@ async fn stream_with_max_tokens_recovery(
     let mut provider_rate_limit_started_at: Option<tokio::time::Instant> = None;
     let mut last_provider_rate_limit_message: Option<String> = None;
     let mut zero_output_recovery_context: Option<AgentContext> = None;
-    let mut reasoning = config.reasoning;
+    let reasoning = config.reasoning;
 
     loop {
         let attempt_context = zero_output_recovery_context.as_ref().unwrap_or(context);
@@ -662,7 +658,6 @@ async fn stream_with_max_tokens_recovery(
                 zero_output_transport_attempts = zero_output_transport_attempts.saturating_add(1);
                 zero_output_recovery_context =
                     Some(context_with_zero_output_transport_recovery(context));
-                reasoning = zero_output_transport_retry_reasoning(config.reasoning);
                 let delay = provider_retry_delay(
                     ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
                     zero_output_transport_attempts,
@@ -958,24 +953,6 @@ async fn stream_assistant_response(
     )
     .await;
     Err(LoopError::Stream(StreamError::Empty))
-}
-
-fn context_with_zero_output_transport_recovery(context: &AgentContext) -> AgentContext {
-    let mut recovered = context.clone();
-    recovered.messages.push(AgentMessage::System {
-        content: ZERO_OUTPUT_TRANSPORT_RECOVERY_CONTEXT.to_string(),
-        timestamp: Some(now_ms()),
-    });
-    recovered
-}
-
-fn zero_output_transport_retry_reasoning(reasoning: ReasoningEffort) -> ReasoningEffort {
-    match reasoning {
-        ReasoningEffort::Medium | ReasoningEffort::High | ReasoningEffort::XHigh => {
-            ReasoningEffort::Minimal
-        }
-        ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::Low => reasoning,
-    }
 }
 
 fn loop_error_from_stream_kind(kind: StreamErrorKind, message: String) -> LoopError {
@@ -1853,8 +1830,8 @@ mod tests {
         assert_eq!(requests[0].reasoning, ReasoningEffort::High);
         assert_eq!(
             requests[1].reasoning,
-            ReasoningEffort::Minimal,
-            "zero-output replay should lower high reasoning so reasoning-heavy private-only spins can produce a tool call"
+            ReasoningEffort::High,
+            "transport recovery must preserve the caller reasoning policy"
         );
         assert!(
             requests[1].messages.iter().any(|message| matches!(
@@ -1863,9 +1840,9 @@ mod tests {
                     if content.contains("transport recovery")
                         && content.contains("no visible assistant text")
                         && content.contains("no usable tool call")
-                        && content.contains("unusable burst of partial tool calls")
-                        && content.contains("exactly one next structured tool call")
-                        && content.contains("next structured tool call")
+                        && content.contains("latest user request")
+                        && content.contains("ordinary final assistant response")
+                        && !content.contains("final response tool")
             )),
             "zero-output replay must carry explicit recovery context"
         );
