@@ -212,3 +212,59 @@ async fn recovery_skipped_when_no_starting_cap() {
 
     assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn repeated_truncation_stops_without_accepting_an_incomplete_answer() {
+    let scripted = ScriptedStream::new(vec![
+        truncated_assistant(),
+        truncated_assistant(),
+        truncated_assistant(),
+    ]);
+    let config = AgentBuilder::new()
+        .stream(scripted.clone() as Arc<dyn StreamFn>)
+        .max_output_tokens(4096)
+        .build()
+        .expect("builder");
+    let result = run(
+        vec![],
+        AgentContext::new("system"),
+        &config,
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(result, Err(clark_agent::LoopError::Stream(
+        clark_agent::StreamError::Fatal(message)
+    )) if message.contains("output token limit")));
+    assert_eq!(scripted.seen_caps.lock().unwrap().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn truncation_and_transport_errors_share_one_attempt_budget() {
+    let mut error = complete_assistant("");
+    if let AgentMessage::Assistant {
+        stop_reason,
+        error_message,
+        ..
+    } = &mut error
+    {
+        *stop_reason = StopReason::Error;
+        *error_message = Some("original upstream error".into());
+    }
+    let scripted = ScriptedStream::new(vec![truncated_assistant(), truncated_assistant(), error]);
+    let config = AgentBuilder::new()
+        .stream(scripted.clone() as Arc<dyn StreamFn>)
+        .max_output_tokens(4096)
+        .build()
+        .expect("builder");
+    let result = run(
+        vec![],
+        AgentContext::new("system"),
+        &config,
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(result, Err(clark_agent::LoopError::Stream(
+        clark_agent::StreamError::Transient(message)
+    )) if message == "original upstream error"));
+    assert_eq!(scripted.seen_caps.lock().unwrap().len(), 3);
+}

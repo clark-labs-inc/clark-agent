@@ -35,16 +35,10 @@ use crate::types::{
     AgentContext, AgentMessage, AssistantContent, StopReason, ToolResultContent, Usage,
 };
 
-const EMPTY_STREAM_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
-const ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY: std::time::Duration =
-    std::time::Duration::from_millis(500);
-const PROVIDER_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-const ZERO_OUTPUT_TRANSPORT_RECOVERY_CONTEXT: &str = "\
-[runtime context — transport recovery, not user instruction]\n\
-The previous provider attempt produced no actionable output: no visible assistant text and no usable tool call reached the runtime. \
-It may have produced private-only reasoning or an unusable burst of partial tool calls. \
-Do not continue with private reasoning only. Re-read the latest observation and immediately choose exactly one next structured tool call; \
-if the answer is ready, use the final response tool.";
+mod provider_recovery;
+mod transport_recovery;
+use provider_recovery::stream_with_max_tokens_recovery;
+use transport_recovery::context_with_zero_output_transport_recovery;
 
 /// Outcome label for a completed run.
 ///
@@ -55,17 +49,24 @@ pub enum LoopOutcome {
     /// Model emitted a final assistant turn with no tool calls and no
     /// pending steering. The natural happy path.
     Done,
+    /// The configured iteration ceiling was reached while more model work was
+    /// still pending. Earlier typed transcript events remain available, but
+    /// this is not a complete answer.
+    HitMaxIterations,
 }
 
 impl LoopOutcome {
     /// Whether this outcome implies a clean, non-partial final answer.
     pub fn is_complete(self) -> bool {
-        true
+        matches!(self, Self::Done)
     }
 
     /// Short stable label suitable for logs and tool-result prefixes.
     pub fn label(self) -> &'static str {
-        "done"
+        match self {
+            Self::Done => "done",
+            Self::HitMaxIterations => "hit_max_iterations",
+        }
     }
 }
 
@@ -184,6 +185,7 @@ async fn inner_run(
 ) -> Result<LoopOutcome, LoopError> {
     let mut first_turn = true;
     let mut iterations: usize = 0;
+    let mut hit_max_iterations = false;
 
     // Steering messages may already be queued (caller produced them
     // before calling `run`).
@@ -211,6 +213,10 @@ async fn inner_run(
         while has_more_tool_calls || !pending.is_empty() {
             if signal.is_cancelled() {
                 return Err(LoopError::Aborted);
+            }
+            if config.max_iterations.is_some_and(|max| iterations >= max) {
+                hit_max_iterations = true;
+                break;
             }
             iterations += 1;
 
@@ -382,7 +388,7 @@ async fn inner_run(
         // a clean terminator vote means the run is done; follow-up
         // sources exist to nudge the model toward a terminator when
         // it failed to emit one, not to overrule one it already cast.
-        let follow_up = if last_batch_terminated {
+        let follow_up = if last_batch_terminated || hit_max_iterations {
             Vec::new()
         } else {
             collect_follow_up(config).await
@@ -390,6 +396,10 @@ async fn inner_run(
         if !follow_up.is_empty() {
             pending = follow_up;
             continue 'outer;
+        }
+
+        if hit_max_iterations {
+            break 'outer;
         }
 
         break;
@@ -403,7 +413,11 @@ async fn inner_run(
     )
     .await;
 
-    Ok(LoopOutcome::Done)
+    Ok(if hit_max_iterations {
+        LoopOutcome::HitMaxIterations
+    } else {
+        LoopOutcome::Done
+    })
 }
 
 async fn collect_steering(config: &LoopConfig) -> Vec<AgentMessage> {
@@ -563,133 +577,6 @@ async fn stream_with_overflow_recovery(
             other => return other,
         }
     }
-}
-
-async fn stream_with_max_tokens_recovery(
-    context: &AgentContext,
-    config: &LoopConfig,
-    signal: &CancellationToken,
-    iteration: usize,
-) -> Result<(AgentMessage, Option<std::collections::HashSet<String>>), LoopError> {
-    let mut current_cap = config.max_output_tokens;
-    let mut max_tokens_attempt: u32 = 0;
-    let mut empty_stream_attempts: u32 = 0;
-    let mut zero_output_transport_attempts: u32 = 0;
-    let mut transient_stream_attempts: u32 = 0;
-    let mut zero_output_recovery_context: Option<AgentContext> = None;
-    let mut reasoning = config.reasoning;
-
-    loop {
-        let attempt_context = zero_output_recovery_context.as_ref().unwrap_or(context);
-        let (assistant, allowlist) = match stream_assistant_response(
-            attempt_context,
-            config,
-            signal,
-            iteration,
-            current_cap,
-            reasoning,
-        )
-        .await
-        {
-            Ok(pair) => pair,
-            Err(LoopError::Stream(StreamError::Empty)) => {
-                empty_stream_attempts = empty_stream_attempts.saturating_add(1);
-                let delay =
-                    provider_retry_delay(EMPTY_STREAM_RETRY_INITIAL_DELAY, empty_stream_attempts);
-                tokio::select! {
-                    _ = signal.cancelled() => return Err(LoopError::Aborted),
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                continue;
-            }
-            Err(LoopError::Stream(StreamError::ZeroOutputTransport(_))) => {
-                zero_output_transport_attempts = zero_output_transport_attempts.saturating_add(1);
-                zero_output_recovery_context =
-                    Some(context_with_zero_output_transport_recovery(context));
-                reasoning = zero_output_transport_retry_reasoning(config.reasoning);
-                let delay = provider_retry_delay(
-                    ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
-                    zero_output_transport_attempts,
-                );
-                tokio::select! {
-                    _ = signal.cancelled() => return Err(LoopError::Aborted),
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                continue;
-            }
-            Err(LoopError::Stream(
-                StreamError::Transient(_) | StreamError::ProviderRateLimited(_),
-            )) => {
-                transient_stream_attempts = transient_stream_attempts.saturating_add(1);
-                let delay = provider_retry_delay(
-                    ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
-                    transient_stream_attempts,
-                );
-                tokio::select! {
-                    _ = signal.cancelled() => return Err(LoopError::Aborted),
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-
-        let stop_reason = match &assistant {
-            AgentMessage::Assistant { stop_reason, .. } => *stop_reason,
-            _ => StopReason::Other,
-        };
-        if stop_reason == StopReason::Aborted {
-            return Err(LoopError::Aborted);
-        }
-        if stop_reason == StopReason::Error {
-            transient_stream_attempts = transient_stream_attempts.saturating_add(1);
-            let delay = provider_retry_delay(
-                ZERO_OUTPUT_TRANSPORT_RETRY_INITIAL_DELAY,
-                transient_stream_attempts,
-            );
-            tokio::select! {
-                _ = signal.cancelled() => return Err(LoopError::Aborted),
-                _ = tokio::time::sleep(delay) => {}
-            }
-            continue;
-        }
-        if stop_reason != StopReason::MaxTokens {
-            return Ok((assistant, allowlist));
-        }
-        // No starting cap means there's no number to scale from. Refuse
-        // recovery rather than guess — the deployment hadn't pinned a
-        // cap, so the truncation came from a provider-side limit we
-        // don't know how to raise.
-        let Some(prev_cap) = current_cap else {
-            return Ok((assistant, allowlist));
-        };
-        let new_cap = prev_cap.saturating_mul(2);
-        if new_cap <= prev_cap {
-            return Ok((assistant, allowlist));
-        }
-
-        max_tokens_attempt = max_tokens_attempt.saturating_add(1);
-        emit(
-            config,
-            AgentEvent::OutputTokensEscalation {
-                attempt: max_tokens_attempt,
-                prev_cap,
-                new_cap,
-            },
-        )
-        .await;
-        current_cap = Some(new_cap);
-        // Discard the truncated `assistant` by simply not pushing it
-        // into the caller's transcript. The MessageStart/MessageEnd
-        // events for it already fired from the inner streamer; the
-        // OutputTokensEscalation event above is the listener's signal
-        // to roll the previous pair back from any projection.
-    }
-}
-
-fn provider_retry_delay(base: std::time::Duration, attempt: u32) -> std::time::Duration {
-    base.saturating_mul(attempt.min(64))
-        .min(PROVIDER_RETRY_MAX_DELAY)
 }
 
 async fn stream_assistant_response(
@@ -875,24 +762,6 @@ async fn stream_assistant_response(
     )
     .await;
     Err(LoopError::Stream(StreamError::Empty))
-}
-
-fn context_with_zero_output_transport_recovery(context: &AgentContext) -> AgentContext {
-    let mut recovered = context.clone();
-    recovered.messages.push(AgentMessage::System {
-        content: ZERO_OUTPUT_TRANSPORT_RECOVERY_CONTEXT.to_string(),
-        timestamp: Some(now_ms()),
-    });
-    recovered
-}
-
-fn zero_output_transport_retry_reasoning(reasoning: ReasoningEffort) -> ReasoningEffort {
-    match reasoning {
-        ReasoningEffort::Medium | ReasoningEffort::High | ReasoningEffort::XHigh => {
-            ReasoningEffort::Minimal
-        }
-        ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::Low => reasoning,
-    }
 }
 
 fn loop_error_from_stream_kind(kind: StreamErrorKind, message: String) -> LoopError {
@@ -1183,6 +1052,27 @@ mod tests {
         failures_before_success: usize,
     }
 
+    struct ProviderRateLimitedStream {
+        calls: AtomicUsize,
+        stall_after_first: bool,
+    }
+
+    impl ProviderRateLimitedStream {
+        fn immediate() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                stall_after_first: false,
+            }
+        }
+
+        fn then_stall() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                stall_after_first: true,
+            }
+        }
+    }
+
     impl EmptyThenTextStream {
         fn new(failures_before_success: usize) -> Self {
             Self {
@@ -1354,6 +1244,31 @@ mod tests {
                 StreamEvent::Start { partial },
                 StreamEvent::Done {
                     message: text_assistant_message("recovered"),
+                },
+            ]))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for ProviderRateLimitedStream {
+        async fn stream(
+            &self,
+            _request: StreamRequest,
+            _signal: CancellationToken,
+        ) -> BoxStream<'static, StreamEvent> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.stall_after_first && call > 0 {
+                return Box::pin(stream::pending());
+            }
+            let partial = empty_assistant_message();
+            Box::pin(stream::iter(vec![
+                StreamEvent::Start {
+                    partial: partial.clone(),
+                },
+                StreamEvent::Error {
+                    partial,
+                    kind: StreamErrorKind::ProviderRateLimited,
+                    message: "upstream provider shared pool is rate limited".to_string(),
                 },
             ]))
         }
@@ -1617,8 +1532,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn empty_stream_recovery_outlives_the_legacy_three_attempt_cap() {
-        let stream = Arc::new(EmptyThenTextStream::new(4));
+    async fn empty_stream_recovers_within_the_shared_attempt_budget() {
+        let stream = Arc::new(EmptyThenTextStream::new(2));
         let config = AgentBuilder::new()
             .stream(stream.clone())
             .model_id("test-model")
@@ -1632,13 +1547,69 @@ mod tests {
         let (assistant, _allowlist) =
             stream_with_max_tokens_recovery(&context, &config, &CancellationToken::new(), 0)
                 .await
-                .expect("fifth stream attempt should recover");
+                .expect("third stream attempt should recover");
 
         let AgentMessage::Assistant { content, .. } = assistant else {
             panic!("expected assistant response");
         };
         assert_eq!(content.plain_text(), "recovered");
-        assert_eq!(stream.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_rate_limit_outer_retry_has_a_hard_attempt_ceiling() {
+        let stream = Arc::new(ProviderRateLimitedStream::immediate());
+        let config = AgentBuilder::new()
+            .stream(stream.clone())
+            .model_id("test-model")
+            .build()
+            .expect("config builds");
+        let context = AgentContext::new("system").with_messages(vec![AgentMessage::User {
+            content: UserContent::Text("continue".to_string()),
+            timestamp: None,
+        }]);
+
+        let result =
+            stream_with_max_tokens_recovery(&context, &config, &CancellationToken::new(), 0).await;
+
+        assert!(matches!(
+            result,
+            Err(LoopError::Stream(StreamError::ProviderRateLimited(message)))
+                if message.contains("shared pool")
+        ));
+        assert_eq!(
+            stream.calls.load(Ordering::SeqCst),
+            provider_recovery::PROVIDER_RECOVERY_MAX_ATTEMPTS as usize
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_rate_limit_outer_retry_has_a_hard_elapsed_ceiling() {
+        let stream = Arc::new(ProviderRateLimitedStream::then_stall());
+        let config = AgentBuilder::new()
+            .stream(stream.clone())
+            .model_id("test-model")
+            .build()
+            .expect("config builds");
+        let context = AgentContext::new("system").with_messages(vec![AgentMessage::User {
+            content: UserContent::Text("continue".to_string()),
+            timestamp: None,
+        }]);
+        let started_at = tokio::time::Instant::now();
+
+        let result =
+            stream_with_max_tokens_recovery(&context, &config, &CancellationToken::new(), 0).await;
+
+        assert!(matches!(
+            result,
+            Err(LoopError::Stream(StreamError::ProviderRateLimited(message)))
+                if message.contains("shared pool")
+        ));
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            started_at.elapsed(),
+            provider_recovery::PROVIDER_RECOVERY_MAX_ELAPSED
+        );
     }
 
     #[tokio::test]
@@ -1671,8 +1642,8 @@ mod tests {
         assert_eq!(requests[0].reasoning, ReasoningEffort::High);
         assert_eq!(
             requests[1].reasoning,
-            ReasoningEffort::Minimal,
-            "zero-output replay should lower high reasoning so reasoning-heavy private-only spins can produce a tool call"
+            ReasoningEffort::High,
+            "transport recovery must preserve the caller reasoning policy"
         );
         assert!(
             requests[1].messages.iter().any(|message| matches!(
@@ -1681,9 +1652,9 @@ mod tests {
                     if content.contains("transport recovery")
                         && content.contains("no visible assistant text")
                         && content.contains("no usable tool call")
-                        && content.contains("unusable burst of partial tool calls")
-                        && content.contains("exactly one next structured tool call")
-                        && content.contains("next structured tool call")
+                        && content.contains("latest user request")
+                        && content.contains("ordinary final assistant response")
+                        && !content.contains("final response tool")
             )),
             "zero-output replay must carry explicit recovery context"
         );
@@ -1694,6 +1665,85 @@ mod tests {
     /// — the test asserts the loop never re-enters the LLM.
     struct TerminatorOnlyStream {
         calls: AtomicUsize,
+    }
+
+    struct RepeatingToolStream {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for RepeatingToolStream {
+        async fn stream(
+            &self,
+            _request: StreamRequest,
+            _signal: CancellationToken,
+        ) -> BoxStream<'static, StreamEvent> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let partial = empty_assistant_message();
+            let assistant = tool_call_assistant_message("continue", format!("tc-{call}"));
+            Box::pin(stream::iter(vec![
+                StreamEvent::Start { partial },
+                StreamEvent::Done { message: assistant },
+            ]))
+        }
+    }
+
+    struct NonTerminatingTool;
+
+    #[async_trait::async_trait]
+    impl crate::tool::AgentTool for NonTerminatingTool {
+        fn name(&self) -> &str {
+            "continue"
+        }
+
+        fn description(&self) -> &str {
+            "keep working"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _call_id: &str,
+            _args: serde_json::Value,
+            _signal: CancellationToken,
+            _update: tokio::sync::mpsc::UnboundedSender<crate::tool::ToolResult>,
+        ) -> Result<crate::tool::ToolResult, crate::error::ToolError> {
+            Ok(crate::tool::ToolResult::text("continue"))
+        }
+    }
+
+    #[tokio::test]
+    async fn max_iterations_stops_a_nonterminating_tool_loop() {
+        let stream = Arc::new(RepeatingToolStream {
+            calls: AtomicUsize::new(0),
+        });
+        let tools = crate::tool::ToolRegistry::new().with(Arc::new(NonTerminatingTool));
+        let config = AgentBuilder::new()
+            .stream(stream.clone())
+            .tools(tools)
+            .max_iterations(3)
+            .build()
+            .expect("config builds");
+        let prompts = vec![AgentMessage::User {
+            content: UserContent::Text("work".to_string()),
+            timestamp: None,
+        }];
+
+        let result = run(
+            prompts,
+            AgentContext::new("system"),
+            &config,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("iteration cap is a typed outcome");
+
+        assert_eq!(stream.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(result.outcome, LoopOutcome::HitMaxIterations);
+        assert!(!result.outcome.is_complete());
     }
 
     impl Default for TerminatorOnlyStream {

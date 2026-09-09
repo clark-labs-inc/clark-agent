@@ -240,6 +240,27 @@ impl Plugin for BlockBananas {
         PluginCapabilities::before_tool_call()
     }
 }
+
+struct AttachEvidence;
+impl Plugin for AttachEvidence {
+    fn name(&self) -> &'static str {
+        "attach_evidence"
+    }
+    fn capabilities(&self) -> PluginCapabilities {
+        PluginCapabilities::before_tool_call()
+    }
+}
+#[async_trait]
+impl BeforeToolCall for AttachEvidence {
+    async fn on_before_tool_call(
+        &self,
+        ctx: clark_agent::plugin::BeforeToolCallContext<'_>,
+    ) -> BeforeToolDecision {
+        let mut args = ctx.args.clone();
+        args["text"] = Value::String("evidenced delivery".into());
+        BeforeToolDecision::allow_with_args(args)
+    }
+}
 #[async_trait]
 impl BeforeToolCall for BlockBananas {
     async fn on_before_tool_call(
@@ -501,21 +522,14 @@ async fn before_hook_blocks_tool_call() {
 }
 
 #[tokio::test]
-async fn max_tool_calls_per_turn_preserves_extra_calls_with_error_results() {
+async fn before_hook_can_normalize_arguments_before_execution() {
     let turn1 = AgentMessage::Assistant {
         content: AssistantContent {
-            blocks: vec![
-                AssistantBlock::ToolCall(ToolCall {
-                    id: "c1".into(),
-                    name: "echo".into(),
-                    arguments: serde_json::json!({"text": "first"}),
-                }),
-                AssistantBlock::ToolCall(ToolCall {
-                    id: "c2".into(),
-                    name: "echo".into(),
-                    arguments: serde_json::json!({"text": "second"}),
-                }),
-            ],
+            blocks: vec![AssistantBlock::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"text": "model payload"}),
+            })],
         },
         stop_reason: StopReason::ToolUse,
         error_message: None,
@@ -529,15 +543,10 @@ async fn max_tool_calls_per_turn_preserves_extra_calls_with_error_results() {
         timestamp: None,
         usage: None,
     };
-    let stream = Arc::new(ScriptedStream::new(vec![turn1, turn2]));
-
-    let (sink, mut rx) = ChannelSink::new();
-    let registry = ToolRegistry::new().with(Arc::new(EchoTool));
     let config = AgentBuilder::new()
-        .stream(stream)
-        .tools(registry)
-        .event_sink(Arc::new(sink))
-        .max_tool_calls_per_turn(1)
+        .stream(Arc::new(ScriptedStream::new(vec![turn1, turn2])))
+        .tools(ToolRegistry::new().with(Arc::new(EchoTool)))
+        .before_tool_call(AttachEvidence)
         .build()
         .unwrap();
 
@@ -554,78 +563,17 @@ async fn max_tool_calls_per_turn_preserves_extra_calls_with_error_results() {
     .unwrap()
     .messages;
 
-    drop(config);
-    let mut events = Vec::new();
-    while let Some(e) = rx.recv().await {
-        events.push(e);
-    }
-
-    let AgentMessage::Assistant { content, .. } = &messages[1] else {
-        panic!("expected assistant tool call");
+    let AgentMessage::ToolResult { content, .. } = &messages[2] else {
+        panic!("expected tool result");
     };
-    assert_eq!(content.tool_calls().len(), 2);
-    assert_eq!(content.tool_calls()[0].id, "c1");
-    assert_eq!(content.tool_calls()[1].id, "c2");
-    assert_eq!(
-        messages
-            .iter()
-            .filter(|message| matches!(
-                message,
-                AgentMessage::ToolResult { tool_call_id, .. } if tool_call_id == "c2"
-            ))
-            .count(),
-        1,
-    );
-    let AgentMessage::ToolResult {
-        tool_call_id,
-        content,
-        ..
-    } = &messages[2]
-    else {
-        panic!("expected first tool result");
+    let ToolResultBlock::Text(text) = &content.blocks[0] else {
+        panic!("expected text result");
     };
-    assert_eq!(tool_call_id, "c1");
-    let ToolResultBlock::Text(t) = &content.blocks[0] else {
-        panic!()
-    };
-    assert_eq!(t.text, "first");
-
-    let AgentMessage::ToolResult {
-        tool_call_id,
-        content,
-        is_error,
-        ..
-    } = &messages[3]
-    else {
-        panic!("expected synthetic error result");
-    };
-    assert_eq!(tool_call_id, "c2");
-    assert!(*is_error);
-    let ToolResultBlock::Text(t) = &content.blocks[0] else {
-        panic!()
-    };
-    assert!(t.text.contains("not executed"));
-    assert!(t.text.contains("only the first 1 call"));
-    assert_ne!(t.text, "second");
-
-    let c2_end = events
-        .iter()
-        .find(|event| {
-            matches!(
-                event,
-                AgentEvent::ToolExecutionEnd {
-                    tool_call_id,
-                    is_error: true,
-                    ..
-                } if tool_call_id == "c2"
-            )
-        })
-        .expect("synthetic result should emit a tool end event");
-    let AgentEvent::ToolExecutionEnd { result, .. } = c2_end else {
-        unreachable!()
-    };
-    assert!(result.is_error);
+    assert_eq!(text.text, "evidenced delivery");
 }
+
+#[path = "support/batch_budget.rs"]
+mod batch_budget;
 
 #[tokio::test]
 async fn ok_tool_result_can_still_mark_context_error() {
@@ -731,7 +679,7 @@ async fn execution_tool_error_remains_context_event() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn transient_stream_error_retries_until_cancelled() {
+async fn cancellation_interrupts_transient_recovery_delay() {
     let stream = Arc::new(EventScriptedStream::new(vec![StreamEvent::Error {
         partial: empty_assistant(StopReason::Other, None),
         kind: StreamErrorKind::Transient,
@@ -742,7 +690,7 @@ async fn transient_stream_error_retries_until_cancelled() {
     let signal = CancellationToken::new();
     let cancel = signal.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         cancel.cancel();
     });
 
@@ -818,14 +766,14 @@ async fn aborted_stream_error_emits_aborted_message_end() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn empty_stream_retries_until_cancelled() {
+async fn cancellation_interrupts_empty_stream_recovery_delay() {
     let stream = Arc::new(EventScriptedStream::new(Vec::new()));
     let config = AgentBuilder::new().stream(stream).build().unwrap();
 
     let signal = CancellationToken::new();
     let cancel = signal.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         cancel.cancel();
     });
 
