@@ -1,8 +1,12 @@
 use super::*;
 
-/// One shared recovery budget, including mixed transport failures and output truncation.
+/// One shared attempt ceiling, including mixed transport failures and truncation.
 pub(super) const PROVIDER_RECOVERY_MAX_ATTEMPTS: u32 = 3;
-pub(super) const PROVIDER_RECOVERY_MAX_ELAPSED: std::time::Duration =
+// Admission window after the first failure, not a deadline for an admitted
+// request. StreamFn owns request/idle timeouts; the caller owns run cancellation.
+// Applying the remaining window to an in-flight request makes later attempts
+// progressively less likely to succeed even when the provider recovers.
+pub(super) const PROVIDER_RECOVERY_RETRY_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(120);
 
 pub(super) async fn stream_with_max_tokens_recovery(
@@ -19,28 +23,35 @@ pub(super) async fn stream_with_max_tokens_recovery(
     let mut zero_output_recovery_context: Option<AgentContext> = None;
 
     loop {
+        if let Some(started_at) = recovery_started_at {
+            if started_at.elapsed() >= PROVIDER_RECOVERY_RETRY_WINDOW {
+                return Err(LoopError::Stream(last_error.take().expect("recovery error")));
+            }
+        }
         attempts += 1;
         let attempt_context = zero_output_recovery_context.as_ref().unwrap_or(context);
-        let attempt = stream_assistant_response(
-            attempt_context,
-            config,
-            signal,
-            iteration,
-            current_cap,
-            config.reasoning,
-        );
-        let response = if let Some(started_at) = recovery_started_at {
-            let remaining = PROVIDER_RECOVERY_MAX_ELAPSED.saturating_sub(started_at.elapsed());
-            tokio::select! {
-                _ = signal.cancelled() => return Err(LoopError::Aborted),
-                result = tokio::time::timeout(remaining, attempt) => match result {
-                    Ok(result) => result,
-                    Err(_) => return Err(LoopError::Stream(last_error.take().expect("recovery error"))),
-                }
-            }
-        } else {
-            attempt.await
+        // Cancellation of this attempt must not cancel the parent run or sibling
+        // requests. Also cancel detached transport work when the future is dropped.
+        let attempt_signal = signal.child_token();
+        let attempt_guard = attempt_signal.clone().drop_guard();
+        let timeout = config.stream.attempt_timeout();
+        let response = tokio::select! {
+            biased;
+            _ = signal.cancelled() => return Err(LoopError::Aborted),
+            response = tokio::time::timeout(timeout, stream_assistant_response(
+                attempt_context,
+                config,
+                &attempt_signal,
+                iteration,
+                current_cap,
+                config.reasoning,
+            )) => response.unwrap_or_else(|_| Err(LoopError::Stream(
+                StreamError::RequestTimeout {
+                    timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
+                },
+            ))),
         };
+        drop(attempt_guard);
         let response = match response {
             Ok((assistant, allowlist)) => match &assistant {
                 AgentMessage::Assistant {
@@ -66,6 +77,7 @@ pub(super) async fn stream_with_max_tokens_recovery(
                 error @ (StreamError::Empty
                 | StreamError::ZeroOutputTransport(_)
                 | StreamError::ProviderRateLimited(_)
+                | StreamError::RequestTimeout { .. }
                 | StreamError::Transient(_)),
             )) => {
                 let started_at = *recovery_started_at.get_or_insert_with(tokio::time::Instant::now);
@@ -83,7 +95,7 @@ pub(super) async fn stream_with_max_tokens_recovery(
                         500
                     })
                     .saturating_mul(attempts);
-                let remaining = PROVIDER_RECOVERY_MAX_ELAPSED.saturating_sub(started_at.elapsed());
+                let remaining = PROVIDER_RECOVERY_RETRY_WINDOW.saturating_sub(started_at.elapsed());
                 if delay >= remaining {
                     return Err(LoopError::Stream(error));
                 }

@@ -40,8 +40,13 @@ pub enum LoopError {
 
 #[derive(Debug, Error)]
 pub enum StreamError {
+    /// The current request exceeded the transport-declared attempt lifetime.
+    /// This is a local deadline, not a replay of a previous provider error.
+    #[error("provider request exceeded its {timeout_ms}ms attempt deadline")]
+    RequestTimeout { timeout_ms: u64 },
+
     /// Transient failure: rate limit, network blip, retryable provider
-    /// error. The loop retries within its shared attempt and elapsed ceilings.
+    /// error. The loop retries within its shared attempt ceiling and retry-admission window.
     #[error("transient stream error: {0}")]
     Transient(String),
 

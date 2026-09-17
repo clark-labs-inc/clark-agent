@@ -1584,7 +1584,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn provider_rate_limit_outer_retry_has_a_hard_elapsed_ceiling() {
+    async fn provider_stall_reports_current_attempt_deadline_not_previous_rate_limit() {
         let stream = Arc::new(ProviderRateLimitedStream::then_stall());
         let config = AgentBuilder::new()
             .stream(stream.clone())
@@ -1602,13 +1602,12 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(LoopError::Stream(StreamError::ProviderRateLimited(message)))
-                if message.contains("shared pool")
+            Err(LoopError::Stream(StreamError::RequestTimeout { timeout_ms: 900_000 }))
         ));
         assert_eq!(stream.calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             started_at.elapsed(),
-            provider_recovery::PROVIDER_RECOVERY_MAX_ELAPSED
+            std::time::Duration::from_millis(900_500)
         );
     }
 

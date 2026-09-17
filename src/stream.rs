@@ -225,7 +225,7 @@ pub struct StreamResponse {
     pub tool_calls: Vec<ToolCall>,
 }
 
-/// The transport trait. One method, typed in/out.
+/// The transport contract: typed requests, events, and an attempt deadline.
 ///
 /// Contract:
 /// - Must not panic on request/model/runtime failures. Encode failures in
@@ -238,6 +238,14 @@ pub struct StreamResponse {
 ///   `StreamError::Aborted`-equivalent or simply drop the stream.
 #[async_trait]
 pub trait StreamFn: Send + Sync + 'static {
+    /// Full lifetime of one invocation, including connection, provider thinking,
+    /// streaming, and transport-internal retries. The loop enforces this equally
+    /// on the original request and on retries. Transports with a configured
+    /// timeout must return that same value here rather than layering a new cap.
+    fn attempt_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(15 * 60)
+    }
+
     async fn stream(
         &self,
         request: StreamRequest,
