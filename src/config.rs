@@ -9,6 +9,9 @@
 //! the dispatcher (see `crate::run::PluginDispatch`). This avoids
 //! repeated trait-object downcast attempts at every hook point.
 
+mod inspection;
+mod plugin_registration;
+pub use inspection::PluginNames;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -141,6 +144,7 @@ pub struct LoopConfig {
 
 #[derive(Default)]
 pub(crate) struct PluginRegistry {
+    pub run_guard: Vec<Arc<dyn crate::plugin::RunGuard>>,
     pub before_tool_call: Vec<Arc<dyn BeforeToolCall>>,
     pub after_tool_call: Vec<Arc<dyn AfterToolCall>>,
     pub context_transform: Vec<Arc<dyn ContextTransform>>,
@@ -192,6 +196,12 @@ impl Default for AgentBuilder {
 }
 
 impl AgentBuilder {
+    /// Install a pure guard checked against canonical history before provider work.
+    pub fn run_guard_arc(mut self, guard: Arc<dyn crate::plugin::RunGuard>) -> Self {
+        self.plugins.run_guard.push(guard);
+        self
+    }
+
     pub fn new() -> Self {
         Self {
             stream: None,
@@ -436,59 +446,6 @@ impl AgentBuilder {
         self
     }
 
-    /// Generic plugin registration. Inspects [`Plugin::capabilities`] to
-    /// decide which dispatch lists to add the plugin to. Same `Arc` is
-    /// shared across all enabled capabilities so a single plugin
-    /// instance can implement multiple traits.
-    pub fn plugin<P>(mut self, plugin: Arc<P>) -> Self
-    where
-        P: Plugin
-            + BeforeToolCall
-            + AfterToolCall
-            + ContextTransform
-            + EventObserver
-            + SteeringSource
-            + FollowUpSource
-            + ToolGate
-            + 'static,
-    {
-        let caps = plugin.capabilities();
-        if caps.before_tool_call {
-            self.plugins
-                .before_tool_call
-                .push(plugin.clone() as Arc<dyn BeforeToolCall>);
-        }
-        if caps.after_tool_call {
-            self.plugins
-                .after_tool_call
-                .push(plugin.clone() as Arc<dyn AfterToolCall>);
-        }
-        if caps.context_transform {
-            self.plugins
-                .context_transform
-                .push(plugin.clone() as Arc<dyn ContextTransform>);
-        }
-        if caps.event_observer {
-            self.plugins
-                .event_observer
-                .push(plugin.clone() as Arc<dyn EventObserver>);
-        }
-        if caps.steering {
-            self.plugins
-                .steering
-                .push(plugin.clone() as Arc<dyn SteeringSource>);
-        }
-        if caps.follow_up {
-            self.plugins
-                .follow_up
-                .push(plugin.clone() as Arc<dyn FollowUpSource>);
-        }
-        if caps.tool_gate {
-            self.plugins.tool_gate.push(plugin as Arc<dyn ToolGate>);
-        }
-        self
-    }
-
     pub fn build(self) -> Result<LoopConfig, BuilderError> {
         let stream = self.stream.ok_or(BuilderError::MissingStream)?;
 
@@ -522,257 +479,5 @@ pub enum BuilderError {
     MissingStream,
 }
 
-/// Snapshot of registered plugin names per category, in registration order.
-///
-/// Returned by [`LoopConfig::plugin_names`] for inspection / regression
-/// tests. Order matches the order the loop will invoke each plugin
-/// (left-to-right composition for `ContextTransform`, etc.). Pure read
-/// — does not clone the plugins themselves.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PluginNames {
-    pub before_tool_call: Vec<&'static str>,
-    pub after_tool_call: Vec<&'static str>,
-    pub context_transform: Vec<&'static str>,
-    pub event_observer: Vec<&'static str>,
-    pub steering: Vec<&'static str>,
-    pub follow_up: Vec<&'static str>,
-    pub tool_gate: Vec<&'static str>,
-}
-
-impl LoopConfig {
-    /// Build an [`AgentBuilder`] pre-populated for a child run spawned
-    /// from this config.
-    ///
-    /// Inherits, by value or `Arc`:
-    /// - stream transport, tool registry, token estimator
-    /// - sampling controls (`temperature`, `max_output_tokens`,
-    ///   `reasoning`)
-    /// - default execution mode, `max_tool_calls_per_turn`
-    /// - model id
-    /// - protocol policy ([`ProtocolPolicy`])
-    /// - plain-text-terminal fallback knobs
-    /// - every plugin whose
-    ///   [`crate::plugin::PluginCapabilities::inheritable_to_child`]
-    ///   bit is set
-    ///
-    /// Does **not** inherit:
-    /// - `event_sink` — callers install a child-scoped sink before
-    ///   `build`.
-    /// - `conversation_id` — the child should carry its own identity
-    ///   via [`crate::AgentContext::identity`].
-    /// - plugins that did **not** opt in to inheritance — they remain
-    ///   parent-only.
-    ///
-    /// This is the single primitive for "spawn a fresh child agent with
-    /// the same execution shape as me." A host runtime still registers
-    /// any child-specific guards (delivery gates, terminal guards, etc.)
-    /// on top of the returned builder.
-    pub fn child_builder(&self) -> AgentBuilder {
-        let mut builder = AgentBuilder::new()
-            .stream(self.stream.clone())
-            .tools_arc(self.tools.clone())
-            .default_execution_mode(self.default_execution_mode)
-            .reasoning(self.reasoning)
-            .token_estimator_arc(self.token_estimator.clone())
-            .protocol_policy(self.protocol.clone());
-        if let Some(t) = self.temperature {
-            builder = builder.temperature(t);
-        }
-        if let Some(m) = self.max_output_tokens {
-            builder = builder.max_output_tokens(m);
-        }
-        if let Some(n) = self.max_tool_calls_per_turn {
-            builder = builder.max_tool_calls_per_turn(n);
-        }
-        if let Some(id) = &self.model_id {
-            builder = builder.model_id(id.clone());
-        }
-        if let Some(tool) = &self.plain_text_terminal_fallback_tool {
-            builder = builder
-                .plain_text_terminal_fallback_tool(tool.clone())
-                .plain_text_terminal_fallback_eager(self.plain_text_terminal_fallback_eager)
-                .plain_text_terminal_fallback_eager_nudge(
-                    self.plain_text_terminal_fallback_eager_nudge,
-                );
-        }
-
-        for p in &self.plugins.before_tool_call {
-            if p.capabilities().inheritable_to_child {
-                builder = builder.before_tool_call_arc(p.clone());
-            }
-        }
-        for p in &self.plugins.after_tool_call {
-            if p.capabilities().inheritable_to_child {
-                builder = builder.after_tool_call_arc(p.clone());
-            }
-        }
-        for p in &self.plugins.context_transform {
-            if p.capabilities().inheritable_to_child {
-                builder = builder.context_transform_arc(p.clone());
-            }
-        }
-        for p in &self.plugins.event_observer {
-            if p.capabilities().inheritable_to_child {
-                builder = builder.event_observer_arc(p.clone());
-            }
-        }
-        for p in &self.plugins.steering {
-            if p.capabilities().inheritable_to_child {
-                builder = builder.steering_arc(p.clone());
-            }
-        }
-        for p in &self.plugins.follow_up {
-            if p.capabilities().inheritable_to_child {
-                builder = builder.follow_up_arc(p.clone());
-            }
-        }
-        for p in &self.plugins.tool_gate {
-            if p.capabilities().inheritable_to_child {
-                builder = builder.tool_gate_arc(p.clone());
-            }
-        }
-
-        builder
-    }
-
-    /// Plugin names per category, in registration order. The composition
-    /// order is part of the loop's external contract — bridges and host
-    /// runtimes assemble plugins in a specific order so transforms run
-    /// before token-budget pruning, gates fire before terminator
-    /// validation, etc. Tests use this to pin the assembled order so
-    /// silent reorderings during refactors surface as a diff instead of
-    /// a runtime regression.
-    pub fn plugin_names(&self) -> PluginNames {
-        PluginNames {
-            before_tool_call: self
-                .plugins
-                .before_tool_call
-                .iter()
-                .map(|p| p.name())
-                .collect(),
-            after_tool_call: self
-                .plugins
-                .after_tool_call
-                .iter()
-                .map(|p| p.name())
-                .collect(),
-            context_transform: self
-                .plugins
-                .context_transform
-                .iter()
-                .map(|p| p.name())
-                .collect(),
-            event_observer: self
-                .plugins
-                .event_observer
-                .iter()
-                .map(|p| p.name())
-                .collect(),
-            steering: self.plugins.steering.iter().map(|p| p.name()).collect(),
-            follow_up: self.plugins.follow_up.iter().map(|p| p.name()).collect(),
-            tool_gate: self.plugins.tool_gate.iter().map(|p| p.name()).collect(),
-        }
-    }
-}
-
 #[cfg(test)]
-mod child_builder_tests {
-    use super::*;
-    use crate::plugin::{Plugin, PluginCapabilities};
-    use crate::stream::{StreamEvent, StreamFn, StreamRequest};
-    use async_trait::async_trait;
-    use futures::stream::BoxStream;
-    use futures::StreamExt;
-
-    struct EmptyStream;
-    #[async_trait]
-    impl StreamFn for EmptyStream {
-        async fn stream(
-            &self,
-            _r: StreamRequest,
-            _s: tokio_util::sync::CancellationToken,
-        ) -> BoxStream<'static, StreamEvent> {
-            futures::stream::empty().boxed()
-        }
-    }
-
-    struct ParentOnlyPlugin;
-    impl Plugin for ParentOnlyPlugin {
-        fn name(&self) -> &'static str {
-            "parent_only"
-        }
-        fn capabilities(&self) -> PluginCapabilities {
-            PluginCapabilities::event_observer()
-        }
-    }
-    #[async_trait]
-    impl crate::EventObserver for ParentOnlyPlugin {
-        async fn on_event(&self, _event: &crate::AgentEvent) {}
-    }
-
-    struct InheritablePlugin;
-    impl Plugin for InheritablePlugin {
-        fn name(&self) -> &'static str {
-            "inheritable"
-        }
-        fn capabilities(&self) -> PluginCapabilities {
-            PluginCapabilities::event_observer().with_inheritable_to_child()
-        }
-    }
-    #[async_trait]
-    impl crate::EventObserver for InheritablePlugin {
-        async fn on_event(&self, _event: &crate::AgentEvent) {}
-    }
-
-    #[test]
-    fn child_builder_inherits_only_opted_in_plugins() {
-        let parent = AgentBuilder::new()
-            .stream(Arc::new(EmptyStream))
-            .event_observer(ParentOnlyPlugin)
-            .event_observer(InheritablePlugin)
-            .build()
-            .expect("parent builds");
-
-        let child = parent.child_builder().build().expect("child builds");
-
-        let names = child.plugin_names();
-        assert_eq!(
-            names.event_observer,
-            vec!["inheritable"],
-            "child must drop parent-only plugins"
-        );
-    }
-
-    #[test]
-    fn child_builder_carries_sampling_knobs() {
-        let parent = AgentBuilder::new()
-            .stream(Arc::new(EmptyStream))
-            .temperature(0.3)
-            .max_output_tokens(8192)
-            .max_tool_calls_per_turn(3)
-            .model_id("test-model")
-            .build()
-            .expect("parent builds");
-
-        let child = parent.child_builder().build().expect("child builds");
-
-        assert_eq!(child.temperature, Some(0.3));
-        assert_eq!(child.max_output_tokens, Some(8192));
-        assert_eq!(child.max_tool_calls_per_turn, Some(3));
-        assert_eq!(child.model_id.as_deref(), Some("test-model"));
-    }
-
-    #[test]
-    fn child_builder_gets_an_independent_iteration_budget() {
-        let parent = AgentBuilder::new()
-            .stream(Arc::new(EmptyStream))
-            .max_iterations(30)
-            .build()
-            .expect("parent builds");
-
-        let child = parent.child_builder().build().expect("child builds");
-
-        assert_eq!(parent.max_iterations, Some(30));
-        assert_eq!(child.max_iterations, None);
-    }
-}
+mod child_builder_tests;

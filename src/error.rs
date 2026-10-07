@@ -15,6 +15,10 @@ use thiserror::Error;
 /// produce an error.
 #[derive(Debug, Error)]
 pub enum LoopError {
+    /// A typed runtime safety or recovery budget refused another model turn.
+    #[error("run guard rejected continuation: {0}")]
+    Guardrail(#[from] crate::plugin::RunGuardViolation),
+
     /// Stream transport raised an unrecoverable error. The provider
     /// implementation decides what's recoverable; everything that bubbles
     /// up through `StreamFn::stream` ends the run.
