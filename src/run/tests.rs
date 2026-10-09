@@ -681,3 +681,5 @@ impl crate::tool::AgentTool for TerminalNamedTool {
 mod provider_and_loop;
 
 mod terminal_protocol;
+
+mod context_observations;
