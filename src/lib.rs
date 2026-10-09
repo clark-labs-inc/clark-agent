@@ -38,6 +38,7 @@
 
 pub mod budget;
 pub mod config;
+pub mod context_observations;
 pub mod error;
 pub mod event;
 pub mod exec;
@@ -96,7 +97,7 @@ pub use trajectory::{
     TrajectoryRecorder, TrajectorySink, TRAJECTORY_SCHEMA_VERSION,
 };
 pub use types::{
-    AgentContext, AgentMessage, AssistantBlock, AssistantContent, ImageContent,
+    AgentContext, AgentMessage, AssistantBlock, AssistantContent, ContextObservation, ContextObservationsContent, ImageContent,
     ReasoningDetailsContent, RunIdentity, StopReason, TextContent, ToolResultBlock,
     ToolResultContent, UserBlock, UserContent,
 };

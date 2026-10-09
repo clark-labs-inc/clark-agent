@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::event::AgentEvent;
 use crate::tokens::{TokenEstimator, CHAR_HEURISTIC};
 use crate::tool::{ToolCall, ToolResult};
-use crate::types::{AgentMessage, AssistantContent, Usage};
+use crate::types::{AgentMessage, AssistantContent, ContextObservation, Usage};
 
 // ─── Plugin marker ─────────────────────────────────────────────────
 
@@ -342,6 +342,14 @@ pub trait ContextTransform: Plugin {
     /// itself walks the entire history defeats the optimization.
     fn should_run(&self, _messages: &[AgentMessage], _cx: &TransformContext<'_>) -> bool {
         true
+    }
+
+    /// Select private observations from the final prepared provider view.
+    /// Return only exact host observations, sealed for immutable replay. The
+    /// loop retains them on the response, never in a parallel history cache.
+    /// Compaction, repair and unrelated transforms normally return none.
+    fn history_observations(&self, _messages: &[AgentMessage]) -> Vec<ContextObservation> {
+        Vec::new()
     }
 
     async fn transform(

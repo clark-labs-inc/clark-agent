@@ -99,7 +99,7 @@ pub(super) async fn stream_assistant_response(
         last_provider_usage: last_provider_usage.as_ref(),
         estimator: &*config.token_estimator,
     };
-    let mut messages = context.messages.clone();
+    let mut messages = crate::context_observations::expand(context.messages.clone());
     // Each transform's diff is observable so post-mortems can attribute
     // a specific compaction (shrinker, microcompactor, history-repair,
     // …) to the missing slice the model went on to misuse. Cloning is
@@ -153,6 +153,9 @@ pub(super) async fn stream_assistant_response(
         },
     )
     .await;
+    let observations = config.plugins.context_transform.iter()
+        .flat_map(|transform| transform.history_observations(&messages))
+        .collect::<Vec<_>>();
     let request = StreamRequest {
         system_prompt: context.system_prompt.clone(),
         messages,
@@ -203,7 +206,8 @@ pub(super) async fn stream_assistant_response(
                     .await;
                 }
             }
-            StreamEvent::Done { message } => {
+            StreamEvent::Done { mut message } => {
+                crate::context_observations::attach(&mut message, observations);
                 emit(
                     config,
                     AgentEvent::MessageEnd {
@@ -222,7 +226,7 @@ pub(super) async fn stream_assistant_response(
                     StreamErrorKind::Aborted => StopReason::Aborted,
                     _ => StopReason::Error,
                 };
-                let error_message = AgentMessage::Assistant {
+                let mut error_message = AgentMessage::Assistant {
                     content: match &partial {
                         AgentMessage::Assistant { content, .. } => content.clone(),
                         _ => AssistantContent { blocks: Vec::new() },
@@ -232,6 +236,7 @@ pub(super) async fn stream_assistant_response(
                     timestamp: Some(now_ms()),
                     usage: None,
                 };
+                crate::context_observations::attach(&mut error_message, observations);
                 emit(
                     config,
                     AgentEvent::MessageEnd {
@@ -246,13 +251,14 @@ pub(super) async fn stream_assistant_response(
 
     // Stream ended without `Done` or `Error`. Synthesize an empty
     // assistant message so the loop can recover.
-    let empty = AgentMessage::Assistant {
+    let mut empty = AgentMessage::Assistant {
         content: AssistantContent { blocks: Vec::new() },
         stop_reason: StopReason::Error,
         error_message: Some("stream ended without terminal event".into()),
         timestamp: Some(now_ms()),
         usage: None,
     };
+    crate::context_observations::attach(&mut empty, observations);
     emit(
         config,
         AgentEvent::MessageEnd {
