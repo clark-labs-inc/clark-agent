@@ -15,6 +15,10 @@ use thiserror::Error;
 /// produce an error.
 #[derive(Debug, Error)]
 pub enum LoopError {
+    /// A typed runtime safety or recovery budget refused another model turn.
+    #[error("run guard rejected continuation: {0}")]
+    Guardrail(#[from] crate::plugin::RunGuardViolation),
+
     /// Stream transport raised an unrecoverable error. The provider
     /// implementation decides what's recoverable; everything that bubbles
     /// up through `StreamFn::stream` ends the run.
@@ -40,13 +44,18 @@ pub enum LoopError {
 
 #[derive(Debug, Error)]
 pub enum StreamError {
+    /// The current request exceeded the transport-declared attempt lifetime.
+    /// This is a local deadline, not a replay of a previous provider error.
+    #[error("provider request exceeded its {timeout_ms}ms attempt deadline")]
+    RequestTimeout { timeout_ms: u64 },
+
     /// Transient failure: rate limit, network blip, retryable provider
-    /// error. The loop retries these until caller cancellation.
+    /// error. The loop retries within its shared attempt ceiling and retry-admission window.
     #[error("transient stream error: {0}")]
     Transient(String),
 
     /// The selected model/provider is temporarily rate-limited. The
-    /// loop retries until the provider recovers or the caller cancels.
+    /// loop applies the same bounded recovery budget as other transport errors.
     #[error("provider rate-limited request: {0}")]
     ProviderRateLimited(String),
 
