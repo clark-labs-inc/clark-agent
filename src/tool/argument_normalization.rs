@@ -97,14 +97,28 @@ pub(super) fn scalar_target_from_schema(prop_schema: &Value) -> Option<ScalarTar
 /// Append a self-correcting hint to a serde-deserialize error message
 /// when the failure pattern is something a model can fix on the next
 /// turn (e.g. "string \"50\", expected usize" → "Did you mean the
-/// integer 50?"). The base error text is preserved verbatim so the
-/// existing format stays diffable; the hint is suffixed after a period.
+/// integer 50?"). Preserve ordinary diagnostics verbatim, but bound long
+/// messages: serde can embed an entire malformed argument in its error.
+/// The original arguments remain in the assistant's tool call in history.
 pub(super) fn enrich_arg_parse_error_message(err: &serde_json::Error) -> String {
     let raw = err.to_string();
-    match arg_parse_hint(&raw) {
+    let message = match arg_parse_hint(&raw) {
         Some(hint) => format!("{raw}. {hint}"),
         None => raw,
-    }
+    };
+    bound_argument_diagnostic(message)
+}
+
+fn bound_argument_diagnostic(message: String) -> String {
+    if message.len() <= 1024 { return message; }
+    // Keep the error kind and beginning of the offending value, plus the
+    // expected contract and recovery hint at the end. Never reinterpret args.
+    let mut head = 384;
+    while !message.is_char_boundary(head) { head -= 1; }
+    let mut tail = message.len() - 512;
+    while !message.is_char_boundary(tail) { tail += 1; }
+    format!("{}\n[... {} diagnostic bytes omitted; original arguments remain in the tool call ...]\n{}",
+        &message[..head], tail - head, &message[tail..])
 }
 
 fn arg_parse_hint(raw: &str) -> Option<String> {
@@ -188,5 +202,41 @@ pub(super) fn strip_top_level_nulls(value: Value) -> Value {
             Value::Object(map.into_iter().filter(|(_, v)| !v.is_null()).collect())
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn short_diagnostics_are_byte_for_byte_unchanged() {
+        for message in [String::new(), "missing field `path`".into(), "x".repeat(1024)] {
+            assert_eq!(bound_argument_diagnostic(message.clone()), message);
+        }
+    }
+
+    #[test]
+    fn long_unicode_diagnostics_preserve_both_ends_with_a_byte_bound() {
+        for width in ["a", "é", "界", "🦀"] {
+            for offset in 0..4 {
+                let message = format!("{}{} expected one of `read`, `write`", "x".repeat(offset), width.repeat(2048));
+                let result = bound_argument_diagnostic(message.clone());
+                assert!(result.len() <= 1024);
+                assert!(result.starts_with(&message[..offset]));
+                assert!(result.ends_with("expected one of `read`, `write`"));
+                assert!(result.contains("diagnostic bytes omitted"));
+            }
+        }
+    }
+
+    #[test]
+    fn long_array_type_errors_retain_expected_type_and_recovery_hint() {
+        let error = serde_json::from_value::<Vec<String>>(serde_json::json!("x".repeat(12000))).unwrap_err();
+        let result = enrich_arg_parse_error_message(&error);
+        assert!(result.len() <= 1024);
+        assert!(result.starts_with("invalid type: string"));
+        assert!(result.contains("expected a sequence"));
+        assert!(result.contains("Expected a JSON array"));
     }
 }

@@ -137,6 +137,55 @@ struct CoercibleArgs {
 
 struct CoercibleTool;
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum DiagnosticArgs {
+    Read { path: String },
+    Write { path: String, content: String },
+}
+
+struct DiagnosticTool;
+
+#[async_trait]
+impl TypedAgentTool for DiagnosticTool {
+    type Args = DiagnosticArgs;
+    fn name(&self) -> &str { "diagnostic" }
+    fn description(&self) -> &str { "fixture" }
+    async fn run(&self, _call_id: &str, args: Self::Args,
+        _signal: CancellationToken, _update: ToolUpdateSink) -> Result<ToolResult, ToolError> {
+        let text = match args {
+            DiagnosticArgs::Read { path } => path,
+            DiagnosticArgs::Write { path, content } => format!("{path}:{content}"),
+        };
+        Ok(ToolResult::text(text))
+    }
+}
+
+#[tokio::test]
+async fn malformed_large_action_stays_rejected_with_compact_recoverable_diagnostic() {
+    let tool = DiagnosticTool;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let action = format!("write<arg_key>content</arg_key><arg_value>{}", "draft 界🦀\n".repeat(2000));
+    let result = AgentTool::execute(&tool, "bad", serde_json::json!({
+        "action": action, "path": "report.md"
+    }), CancellationToken::new(), tx.clone()).await.unwrap();
+    assert!(result.is_error);
+    assert!(!result.terminate);
+    assert_eq!(result.details["kind"], "tool_argument_validation");
+    assert_eq!(result.details["recoverable"], true);
+    let ToolResultBlock::Text(text) = &result.content[0] else { panic!("expected text") };
+    assert!(text.text.len() <= 1100);
+    assert!(text.text.starts_with("diagnostic: invalid arguments: unknown variant `write"));
+    assert!(text.text.ends_with("expected `read` or `write`"));
+    assert!(text.text.contains("diagnostic bytes omitted"));
+    let recovered = AgentTool::execute(&tool, "good", serde_json::json!({
+        "action": "write", "path": "report.md", "content": "recovered"
+    }), CancellationToken::new(), tx).await.unwrap();
+    assert!(!recovered.is_error);
+    let ToolResultBlock::Text(text) = &recovered.content[0] else { panic!("expected text") };
+    assert_eq!(text.text, "report.md:recovered");
+}
+
 #[async_trait]
 impl TypedAgentTool for CoercibleTool {
     type Args = CoercibleArgs;
