@@ -27,9 +27,8 @@ impl crate::ContextTransform for ObservationProjector {
         messages.push(observation().into_message());
         messages
     }
-    fn history_observations(&self, messages: &[AgentMessage]) -> Vec<ContextObservation> {
-        assert_eq!(messages.last(), Some(&observation().into_message()));
-        vec![observation()]
+    fn history_observation(&self, message: &AgentMessage) -> Option<ContextObservation> {
+        (message == &observation().into_message()).then(observation)
     }
 }
 
@@ -55,7 +54,7 @@ async fn canonical_loop_retains_the_final_prepared_observations_on_the_response(
     let mut context = crate::AgentContext::new("system");
     let signal = tokio_util::sync::CancellationToken::new();
     let (response, _) = stream_assistant_response(
-        &context, &config, &signal, 0, None, crate::ReasoningEffort::High,
+        &context, &config, &signal, 0, None, crate::ReasoningEffort::High, &[],
     ).await.unwrap();
     assert_eq!(context.messages.len(), 0, "no parallel history was mutated");
     assert_eq!(expand(vec![response.clone()]), vec![observation().into_message(), assistant()]);
@@ -63,7 +62,7 @@ async fn canonical_loop_retains_the_final_prepared_observations_on_the_response(
     context.messages.push(AgentMessage::User {
         content: crate::UserContent::Text("next question".into()), timestamp: None,
     });
-    stream_assistant_response(&context, &config, &signal, 1, None, crate::ReasoningEffort::High)
+    stream_assistant_response(&context, &config, &signal, 1, None, crate::ReasoningEffort::High, &[])
         .await.unwrap();
     let mut requests = Vec::new();
     while let Ok(event) = events.try_recv() {
@@ -96,7 +95,7 @@ async fn failed_response_event_retains_request_provenance() {
     let config = crate::AgentBuilder::new().stream(Arc::new(FailedResponse))
         .event_sink(Arc::new(sink)).context_transform(ObservationProjector).build().unwrap();
     let result = stream_assistant_response(&crate::AgentContext::new("system"), &config,
-        &CancellationToken::new(), 0, None, crate::ReasoningEffort::High).await;
+        &CancellationToken::new(), 0, None, crate::ReasoningEffort::High, &[]).await;
     assert!(result.is_err());
     let response = std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| {
         if let crate::AgentEvent::MessageEnd { message } = event { Some(message) } else { None }

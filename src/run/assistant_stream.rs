@@ -85,6 +85,7 @@ pub(super) async fn stream_assistant_response(
     iteration: usize,
     max_output_tokens: Option<u32>,
     reasoning: ReasoningEffort,
+    recovery_observations: &[crate::ContextObservation],
 ) -> Result<(AgentMessage, Option<std::collections::HashSet<String>>), LoopError> {
     // Apply context transforms in registration order. The
     // `TransformContext` carries the cancellation signal plus a few
@@ -129,6 +130,11 @@ pub(super) async fn stream_assistant_response(
         .await;
     }
 
+    // Retry facts follow the complete prepared history, including live host
+    // projections. Inserting before transforms would move those projections
+    // behind the new observation and break an otherwise reusable wire prefix.
+    messages.extend(recovery_observations.iter().cloned().map(crate::ContextObservation::into_message));
+
     // Consult any registered ToolGate plugins for a per-turn allowlist.
     // Each plugin returns `Some(set)` to narrow the advertised tools for
     // exactly this LLM call. Multiple plugins compose by intersection;
@@ -153,9 +159,12 @@ pub(super) async fn stream_assistant_response(
         },
     )
     .await;
-    let observations = config.plugins.context_transform.iter()
-        .flat_map(|transform| transform.history_observations(&messages))
-        .collect::<Vec<_>>();
+    let observations = messages.iter().flat_map(|message| {
+        crate::transport_recovery::snapshot(message).into_iter().chain(
+            config.plugins.context_transform.iter()
+                .filter_map(|transform| transform.history_observation(message)),
+        )
+    }).collect::<Vec<_>>();
     let request = StreamRequest {
         system_prompt: context.system_prompt.clone(),
         messages,
@@ -167,15 +176,8 @@ pub(super) async fn stream_assistant_response(
             .provider_extras
             .clone()
             .unwrap_or(serde_json::Value::Null),
-        // `tool_choice: "required"` on every turn. The LLM-in-charge
-        // contract is "context → LLM → tool call → append result →
-        // repeat" — the model's job is to pick a tool, not emit
-        // narration. This assumes the catalog includes a terminal
-        // text-delivery tool, so required-on-every-turn doesn't trap the
-        // model: when the work is done it calls that delivery tool to
-        // return the answer. If the model loops on verification instead,
-        // the bug is in the catalog or prompt — not in the requirement.
-        force_tool_call: true,
+        // The model chooses whether to use tools or provide its final answer.
+        force_tool_call: false,
     };
 
     let mut stream = config.stream.stream(request, signal.clone()).await;

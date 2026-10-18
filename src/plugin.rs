@@ -344,12 +344,12 @@ pub trait ContextTransform: Plugin {
         true
     }
 
-    /// Select private observations from the final prepared provider view.
-    /// Return only exact host observations, sealed for immutable replay. The
-    /// loop retains them on the response, never in a parallel history cache.
-    /// Compaction, repair and unrelated transforms normally return none.
-    fn history_observations(&self, _messages: &[AgentMessage]) -> Vec<ContextObservation> {
-        Vec::new()
+    /// Seal one exact host observation from the final prepared provider view.
+    /// The loop visits messages in source order and retains observations on the
+    /// response, never in a parallel cache. Return none for sealed history,
+    /// compaction, repair and unrelated messages.
+    fn history_observation(&self, _message: &AgentMessage) -> Option<ContextObservation> {
+        None
     }
 
     async fn transform(

@@ -43,14 +43,8 @@ pub struct StreamRequest {
     /// the typed `reasoning` field above.
     #[allow(clippy::struct_field_names)]
     pub provider_extras: Value,
-    /// When `true`, the wire request sets `tool_choice: "required"` —
-    /// the provider MUST emit a tool call (no plain-text or empty
-    /// completion). Coercive narrowing for the framing turn: paired
-    /// with `OpeningGate`'s compact catalog, this forces the model to
-    /// pick a message or planning tool instead of emitting
-    /// reasoning-only text and skipping the structured turn.
-    /// Default `false` leaves tool choice to the provider for every
-    /// other turn.
+    /// Transport hint retained in the request contract. The canonical loop
+    /// always sets this to `false`, leaving tool selection to the model.
     pub force_tool_call: bool,
 }
 

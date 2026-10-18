@@ -20,7 +20,7 @@ pub(super) async fn stream_with_max_tokens_recovery(
     let mut attempts: u32 = 0;
     let mut recovery_started_at: Option<tokio::time::Instant> = None;
     let mut last_error: Option<StreamError> = None;
-    let mut zero_output_recovery_context: Option<AgentContext> = None;
+    let mut recovery_observations = Vec::new();
 
     loop {
         if let Some(started_at) = recovery_started_at {
@@ -29,7 +29,6 @@ pub(super) async fn stream_with_max_tokens_recovery(
             }
         }
         attempts += 1;
-        let attempt_context = zero_output_recovery_context.as_ref().unwrap_or(context);
         // Cancellation of this attempt must not cancel the parent run or sibling
         // requests. Also cancel detached transport work when the future is dropped.
         let attempt_signal = signal.child_token();
@@ -39,12 +38,13 @@ pub(super) async fn stream_with_max_tokens_recovery(
             biased;
             _ = signal.cancelled() => return Err(LoopError::Aborted),
             response = tokio::time::timeout(timeout, stream_assistant_response(
-                attempt_context,
+                context,
                 config,
                 &attempt_signal,
                 iteration,
                 current_cap,
                 config.reasoning,
+                &recovery_observations,
             )) => response.unwrap_or_else(|_| Err(LoopError::Stream(
                 StreamError::RequestTimeout {
                     timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
@@ -84,9 +84,10 @@ pub(super) async fn stream_with_max_tokens_recovery(
                 if attempts >= PROVIDER_RECOVERY_MAX_ATTEMPTS {
                     return Err(LoopError::Stream(error));
                 }
-                if matches!(&error, StreamError::ZeroOutputTransport(_)) {
-                    zero_output_recovery_context =
-                        Some(context_with_zero_output_transport_recovery(context));
+                if matches!(&error, StreamError::ZeroOutputTransport(_))
+                    && recovery_observations.is_empty()
+                {
+                    recovery_observations.push(zero_output_transport_recovery(super::now_ms()));
                 }
                 let delay =
                     std::time::Duration::from_millis(if matches!(&error, StreamError::Empty) {

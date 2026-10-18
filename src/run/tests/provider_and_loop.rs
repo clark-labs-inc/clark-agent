@@ -226,9 +226,8 @@ async fn zero_output_transport_error_is_retried_before_returning() {
     );
     assert!(
         requests[1].messages.iter().any(|message| matches!(
-            message,
-            AgentMessage::System { content, .. }
-                if content.contains("transport recovery")
+            crate::transport_recovery::render(message),
+            Some(content) if content.contains("transport recovery")
                     && content.contains("no visible assistant text")
                     && content.contains("no usable tool call")
                     && content.contains("latest user request")
