@@ -44,9 +44,8 @@ mod loop_driver;
 mod tool_gates;
 use tool_gates::collect_tool_allowlist_with_events;
 use loop_driver::inner_run;
-mod transport_recovery;
 use provider_recovery::stream_with_max_tokens_recovery;
-use transport_recovery::context_with_zero_output_transport_recovery;
+use crate::transport_recovery::zero_output_transport_recovery;
 
 /// Outcome label for a completed run.
 ///

@@ -55,6 +55,7 @@ pub mod tool;
 pub mod tool_identity;
 pub mod tool_result_budget;
 pub mod trajectory;
+pub mod transport_recovery;
 pub mod types;
 
 pub use budget::TokenBudget;
